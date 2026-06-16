@@ -146,7 +146,7 @@ async def process(req: AnswerRequest):
     ))
 
     packet = await session.on_user_answer(req.text, req.features)
-
+    print(f"[백엔드→TTS 대사] {packet.dialogue}  (stage={packet.stage}, persona={packet.persona}, score={packet.score})")
     # 호환 모드: Node A 가 음성을 되받길 기대하면 HTTP 응답으로 스트리밍.
     if settings.proxy_audio_to_stt:
         await hub.send_packet(sid, packet)
