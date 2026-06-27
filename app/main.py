@@ -38,15 +38,46 @@ class Hub:
     def __init__(self):
         self.sessions: dict[str, InterviewSession] = {}
         self.sockets: dict[str, WebSocket] = {}
+        self.stt_sockets: dict[str, WebSocket] = {}
+        self.tts_sockets: dict[str, websockets.WebSocketClientProtocol] = {}
         self.last_active: str | None = None  # session_id 미지정 POST 라우팅용
         self.lock = asyncio.Lock()
 
-    def register(self, sid: str, ws: WebSocket):
+    async def register(self, sid: str, ws: WebSocket):
         self.sockets[sid] = ws
         self.last_active = sid
+        try:
+            tts_ws = await websockets.connect(settings.tts_ws_url, max_size=None)
+            self.tts_sockets[sid] = tts_ws
+            print(f"[{sid}] Persistent connection to TTS Worker established.")
+        except Exception as e:
+            self.tts_sockets[sid] = None
+            print(f"[Warning] Failed to establish persistent connection to TTS Worker: {e}")
 
-    def unregister(self, sid: str):
+    async def unregister(self, sid: str):
         self.sockets.pop(sid, None)
+        self.stt_sockets.pop(sid, None)
+        tts_ws = self.tts_sockets.pop(sid, None)
+        if tts_ws:
+            try:
+                await tts_ws.close()
+                print(f"[{sid}] Persistent connection to TTS Worker closed.")
+            except Exception as e:
+                print(f"[{sid}] Error closing persistent connection to TTS Worker: {e}")
+
+    async def get_or_connect_tts_ws(self, sid: str):
+        tts_ws = self.tts_sockets.get(sid)
+        if tts_ws is None or tts_ws.state == websockets.State.CLOSED:
+            print(f"[{sid}] TTS WebSocket offline. Attempting lazy reconnect...")
+            try:
+                tts_ws = await websockets.connect(settings.tts_ws_url, max_size=None)
+                self.tts_sockets[sid] = tts_ws
+                print(f"[{sid}] Reconnected to TTS Worker successfully.")
+            except Exception as e:
+                self.tts_sockets[sid] = None
+                print(f"[{sid}] Lazy reconnect to TTS Worker failed: {e}")
+                return None
+        return tts_ws
 
     async def send_packet(self, sid: str, packet: BehaviorPacket):
         ws = self.sockets.get(sid)
@@ -54,7 +85,7 @@ class Hub:
             try:
                 await ws.send_text(packet.model_dump_json())
             except Exception:
-                self.unregister(sid)
+                await self.unregister(sid)
 
     async def send_json(self, sid: str, obj: dict):
         ws = self.sockets.get(sid)
@@ -62,7 +93,7 @@ class Hub:
             try:
                 await ws.send_text(json.dumps(obj, ensure_ascii=False))
             except Exception:
-                self.unregister(sid)
+                await self.unregister(sid)
 
     async def send_audio(self, sid: str, chunk: bytes):
         ws = self.sockets.get(sid)
@@ -70,7 +101,7 @@ class Hub:
             try:
                 await ws.send_bytes(chunk)
             except Exception:
-                self.unregister(sid)
+                await self.unregister(sid)
 
 
 hub = Hub()
@@ -82,14 +113,55 @@ async def speak(sid: str, packet: BehaviorPacket):
     
     if settings.skip_tts:                                  # TTS 생략 모드 (Node B 없이 테스트)
         await hub.send_json(sid, {"type": "audio_end"})
+        stt_ws = hub.stt_sockets.get(sid)
+        if stt_ws:
+            try:
+                await stt_ws.send_json({"type": "end"})
+            except Exception:
+                pass
         return
 
-    try:
-        async for chunk in tts_client.synthesize_stream(packet.dialogue):  # 2) 음성
-            await hub.send_audio(sid, chunk)
-    except Exception as e:
-        print(f"[TTS 연결 실패 - 음성 생략] {e}")           # 에러가 나도 서버는 안 죽음
-    await hub.send_json(sid, {"type": "audio_end"})        # 3) 한 발화 끝     # 3) 한 발화 끝
+    # STT 소켓 연결 대기 (초기 동기화 안정성 확보)
+    stt_ws = None
+    for _ in range(30):
+        stt_ws = hub.stt_sockets.get(sid)
+        if stt_ws:
+            break
+        await asyncio.sleep(0.1)
+
+    tts_ws = await hub.get_or_connect_tts_ws(sid)
+    if tts_ws:
+        try:
+            async for chunk in tts_client.synthesize_ws_stream(tts_ws, packet.dialogue):  # 2) 음성/자막
+                if stt_ws:
+                    try:
+                        if isinstance(chunk, bytes):
+                            await stt_ws.send_bytes(chunk)
+                        else:
+                            await stt_ws.send_text(chunk)
+                    except Exception as se:
+                        print(f"[{sid}] Failed to relay chunk to STT socket: {se}")
+                else:
+                    if isinstance(chunk, bytes):
+                        await hub.send_audio(sid, chunk)
+                    else:
+                        ws_ctrl = hub.sockets.get(sid)
+                        if ws_ctrl:
+                            try:
+                                await ws_ctrl.send_text(chunk)
+                            except:
+                                pass
+        except Exception as e:
+            print(f"[{sid}] [TTS 릴레이 중 에러 - 음성 생략] {e}")
+    else:
+        print(f"[{sid}] [TTS 소켓 유실 - 음성 생략]")
+
+    await hub.send_json(sid, {"type": "audio_end"})        # 3) 한 발화 끝 (Control 채널)
+    if stt_ws:
+        try:
+            await stt_ws.send_json({"type": "end"})        # STT 채널에도 전송
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +185,7 @@ async def ws_control(ws: WebSocket):
                     job_title=msg.get("job_title", ""),
                     resume=msg.get("resume", ""),
                 )
-                hub.register(sid, ws)
+                await hub.register(sid, ws)
                 # 면접관이 먼저 자기소개를 요청 (첫 발화 + 음성)
                 packet = await hub.sessions[sid].first_question()
                 await speak(sid, packet)
@@ -132,7 +204,7 @@ async def ws_control(ws: WebSocket):
         pass
     finally:
         if sid:
-            hub.unregister(sid)
+            await hub.unregister(sid)
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +263,9 @@ async def ws_tts(ws: WebSocket):
     STT 입장에선 기존 TTS와 동일하게 (음성청크 + {"type":"end"}) 를 받는다.
     """
     await ws.accept()
-    print("[/ws/tts] STT 워커 연결됨")
+    sid = ws.query_params.get("session_id", "default")
+    hub.stt_sockets[sid] = ws
+    print(f"[/ws/tts] STT 워커 연결됨 - Session ID: {sid}")
     try:
         while True:
             raw = await ws.receive_text()
@@ -200,43 +274,44 @@ async def ws_tts(ws: WebSocket):
             if not user_text:
                 continue
 
-            sid = hub.last_active or "default"
-            session = hub.sessions.get(sid)
+            msg_sid = msg.get("session_id") or sid or hub.last_active or "default"
+            session = hub.sessions.get(msg_sid)
             if session is None:
-                print("[/ws/tts] 활성 세션 없음 (Unity init 먼저 필요)")
+                print(f"[/ws/tts] 활성 세션 없음 ({msg_sid}) (Unity init 먼저 필요)")
                 await ws.send_json({"type": "end"})
                 continue
 
-            print(f"[STT→백엔드 수신] {user_text}")
+            print(f"[STT→백엔드 수신 ({msg_sid})] {user_text}")
 
             # '생각 중' 모션을 Unity로 먼저
-            await hub.send_packet(sid, BehaviorPacket(
-                type="thinking", session_id=sid, stage=session.stage.value,
+            await hub.send_packet(msg_sid, BehaviorPacket(
+                type="thinking", session_id=msg_sid, stage=session.stage.value,
                 dialogue="", expression_id=ExpressionID.THINKING.value,
                 gesture_id=GestureID.REVIEW_RESUME.value, score=-1,
             ))
 
             # 채점 + 다음 질문 생성
-            packet = await session.on_user_answer(user_text, {})
+            features = msg.get("features", {})
+            packet = await session.on_user_answer(user_text, features)
             print(f"[백엔드→TTS 대사] {packet.dialogue} "
                   f"(stage={packet.stage}, persona={packet.persona}, score={packet.score})")
 
             # 자막 + 행동패킷을 Unity로 (자막=면접관 대사)
-            await hub.send_packet(sid, packet)
+            await hub.send_packet(msg_sid, packet)
 
-            # 면접관 대사를 진짜 TTS로 합성 → 음성을 STT로 릴레이
-            try:
-                async with websockets.connect(settings.tts_ws_url, max_size=None) as tts_ws:
-                    for phrase in tts_client.split_phrases(packet.dialogue):
-                        await tts_ws.send(json.dumps({"text": phrase}))
-                        async for m in tts_ws:
-                            if isinstance(m, str):
-                                if json.loads(m).get("type") == "end":
-                                    break
-                            else:
-                                await ws.send_bytes(m)   # 음성을 STT로 릴레이
-            except Exception as e:
-                print(f"[/ws/tts] TTS 릴레이 실패: {e}")
+            # 면접관 대사를 진짜 TTS로 합성 → 음성/자막을 STT로 릴레이
+            tts_ws = await hub.get_or_connect_tts_ws(msg_sid)
+            if tts_ws:
+                try:
+                    async for chunk in tts_client.synthesize_ws_stream(tts_ws, packet.dialogue):
+                        if isinstance(chunk, bytes):
+                            await ws.send_bytes(chunk)   # 음성을 STT로 릴레이
+                        else:
+                            await ws.send_text(chunk)    # 자막 JSON을 STT로 릴레이
+                except Exception as e:
+                    print(f"[/ws/tts] [{msg_sid}] TTS 릴레이 실패: {e}")
+            else:
+                print(f"[/ws/tts] [{msg_sid}] TTS 소켓 유실로 릴레이 생략")
 
             # 한 발화 끝 신호 (STT가 이걸 받고 Unity VAD 잠금 해제)
             await ws.send_json({"type": "end"})
@@ -244,9 +319,13 @@ async def ws_tts(ws: WebSocket):
             # 면접 종료면 피드백도 Unity로
             if packet.is_final:
                 report = await session.build_feedback()
-                await hub.send_json(sid, report.model_dump())
+                await hub.send_json(msg_sid, report.model_dump())
 
     except WebSocketDisconnect:
-        print("[/ws/tts] STT 워커 연결 종료")
+        print(f"[/ws/tts] STT 워커 연결 종료 - Session ID: {sid}")
     except Exception as e:
-        print(f"[/ws/tts] Error: {e}")
+        print(f"[/ws/tts] Error for Session ID {sid}: {e}")
+    finally:
+        hub.stt_sockets.pop(sid, None)
+
+#python -m uvicorn backend_reference.main:app --host 0.0.0.0 --port 8080 --reload
