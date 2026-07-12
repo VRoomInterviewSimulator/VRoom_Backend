@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import websockets
+from websockets.protocol import State
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -67,7 +68,7 @@ class Hub:
 
     async def get_or_connect_tts_ws(self, sid: str):
         tts_ws = self.tts_sockets.get(sid)
-        if tts_ws is None or tts_ws.state == websockets.State.CLOSED:
+        if tts_ws is None or tts_ws.state == State.CLOSED:
             print(f"[{sid}] TTS WebSocket offline. Attempting lazy reconnect...")
             try:
                 tts_ws = await websockets.connect(settings.tts_ws_url, max_size=None)
