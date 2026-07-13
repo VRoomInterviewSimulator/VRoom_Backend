@@ -241,12 +241,6 @@ async def process(req: AnswerRequest):
 
     # 기본 모드: 행동 패킷 + 음성 모두 백엔드->Unity WS 로 직접 전송.
     await speak(sid, packet)
-
-    # 면접 종료면 피드백 리포트까지 이어서 push.
-    if packet.is_final:
-        report = await session.build_feedback()
-        await hub.send_json(sid, report.model_dump())
-
     return {"ok": True, "stage": packet.stage, "persona": packet.persona, "score": packet.score}
 
 
@@ -317,16 +311,9 @@ async def ws_tts(ws: WebSocket):
             # 한 발화 끝 신호 (STT가 이걸 받고 Unity VAD 잠금 해제)
             await ws.send_json({"type": "end"})
 
-            # 면접 종료면 피드백도 Unity로
-            if packet.is_final:
-                report = await session.build_feedback()
-                await hub.send_json(msg_sid, report.model_dump())
-
     except WebSocketDisconnect:
         print(f"[/ws/tts] STT 워커 연결 종료 - Session ID: {sid}")
     except Exception as e:
         print(f"[/ws/tts] Error for Session ID {sid}: {e}")
     finally:
         hub.stt_sockets.pop(sid, None)
-
-#python -m uvicorn backend_reference.main:app --host 0.0.0.0 --port 8080 --reload

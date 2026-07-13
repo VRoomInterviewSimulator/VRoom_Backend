@@ -96,6 +96,16 @@ def persona_from_score(score: int, consecutive_low: int) -> Persona:
         return Persona.NEUTRAL
     return Persona.NEGATIVE
 
+def persona_value_from_score(score: int, consecutive_low: int) -> float:
+    """답변 점수(0~100) -> 연속 감정 강도(-1.0 ~ +1.0).
+    55점을 중립(0)으로 두고 선형 매핑. score < 0(채점 대상 아님)은 0.0.
+    연속 저점이 누적되면 음의 방향으로 압박을 고착.
+    """
+    if score < 0:
+        return 0.0
+    value = (score - 50) / 50.0;
+    value -= 0.2 * min(consecutive_low, 3) 
+    return max(-1.0, min(1.0, value))
 
 # ---------------------------------------------------------------------------
 # Pydantic 스키마
@@ -134,6 +144,7 @@ class BehaviorPacket(BaseModel):
     session_id: str = ""
     stage: str = ""
     persona: str = Persona.NEUTRAL.value
+    persona_value: float = 0.0 
     dialogue: str = ""
     expression_id: int = ExpressionID.NEUTRAL.value
     gesture_id: int = GestureID.IDLE.value
@@ -145,11 +156,24 @@ class StageScore(BaseModel):
     stage: str
     score: int
 
+class InterviewScore(BaseModel):
+    """Unity 결과 UI의 10개 셀과 1:1. 필드명은 프론트와 동일해야 한다."""
+    gaze: int = 0          # 시선 처리
+    gesture: int = 0       # 손짓 처리
+    posture: int = 0       # 몸짓 처리
+    expression: int = 0    # 표정 처리
+    voiceVolume: int = 0   # 음성 크기
+    voiceSpeed: int = 0    # 음성 속도
+    answerLength: int = 0  # 음성 길이
+    fillerWords: int = 0   # 음성 필러 분석
+    accuracy: int = 0      # 음성 LLM 채점 평균
+    responseTime: int = 0  # 반응 시간
 
 class FeedbackReport(BaseModel):
     """면접 종료 후 Unity의 3D 결과 UI에 시각화할 종합 피드백."""
     type: str = "feedback_report"
     session_id: str = ""
+    scores: InterviewScore = Field(default_factory=InterviewScore)
     overall_score: int = 0
     stage_scores: List[StageScore] = Field(default_factory=list)
     strengths: str = ""
