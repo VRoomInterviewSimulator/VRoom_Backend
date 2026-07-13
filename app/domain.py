@@ -103,7 +103,7 @@ def persona_value_from_score(score: int, consecutive_low: int) -> float:
     """
     if score < 0:
         return 0.0
-    value = (score - 50) / 50.0;
+    value = (score - 50) / 50.0
     value -= 0.2 * min(consecutive_low, 3) 
     return max(-1.0, min(1.0, value))
 

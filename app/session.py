@@ -17,11 +17,10 @@
 (세션이 길어지면 여기서 요약 압축 = LangChain Summary Memory 역할을 넣으면 된다.)
 """
 from __future__ import annotations
-from .domain import (AnswerRequest, BehaviorPacket, ExpressionID, GestureID,
-                     persona_value_from_score, FeedbackReport, StageScore, InterviewScore) 
 
 from . import llm
 from .domain import (
+    AnswerRequest,
     BehaviorPacket,
     ExpressionID,
     ExtractedInfo,
@@ -33,6 +32,8 @@ from .domain import (
     STAGE_ORDER,
     StageScore,
     persona_from_score,
+    persona_value_from_score,
+    InterviewScore
 )
 
 
@@ -181,10 +182,12 @@ class InterviewSession:
         accuracy10 = round((sum(scored) / len(scored)) / 10) if scored else 0
         scores = InterviewScore(accuracy=accuracy10)
 
+        overall = sum(scores.model_dump().values())
+
         return FeedbackReport(
             session_id=self.session_id,
             scores=scores,   
-            overall_score=data.get("overall_score", 0),
+            overall_score=overall, 
             stage_scores=[StageScore(stage=s, score=v) for s, v in self.stage_scores],
             strengths=data.get("strengths", ""),
             improvements=data.get("improvements", ""),
