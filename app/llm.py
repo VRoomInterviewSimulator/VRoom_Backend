@@ -244,3 +244,17 @@ async def generate_feedback(*, company: str, job_title: str, transcript: str,
         data = {"strengths": "", "improvements": "", "summary": ""}
     data["overall_score"] = overall
     return data
+
+# ---------------------------------------------------------------------------
+# (4) 예열 — 첫 실제 호출의 커넥션 수립 비용을 Setup 단계에서 미리 지불
+# ---------------------------------------------------------------------------
+async def warmup() -> None:
+    try:
+        await _get_client().chat.completions.create(
+            model=_model,
+            max_tokens=1,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        print("[llm] warmup 완료")
+    except Exception as e:
+        print(f"[llm] warmup 실패(무시 가능): {e}")

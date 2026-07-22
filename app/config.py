@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     proxy_audio_to_stt: bool = False
     skip_tts: bool = False
     
+    # 첫 질문 정책 / 프리웜
+    template_first_question: bool = True   # True면 첫 질문은 LLM 없이 템플릿으로 생성
+    warmup_llm_on_prepare: bool = True     # prepare 시 OpenAI 커넥션 예열(1토큰 요청)
+
     # provider에 맞는 (base_url, api_key, model) 묶음을 돌려준다.
     def resolve_llm(self) -> tuple[str | None, str, str]:
         if self.llm_provider == "groq":

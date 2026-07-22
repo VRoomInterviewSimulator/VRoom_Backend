@@ -28,6 +28,7 @@ from .config import settings
 from .domain import AnswerRequest, BehaviorPacket, ExpressionID, GestureID
 from .session import InterviewSession
 from . import tts_client
+from . import llm        
 
 app = FastAPI(title="VRoom Backend", version="1.0")
 
@@ -41,12 +42,19 @@ class Hub:
         self.sockets: dict[str, WebSocket] = {}
         self.stt_sockets: dict[str, WebSocket] = {}
         self.tts_sockets: dict[str, websockets.WebSocketClientProtocol] = {}
-        self.last_active: str | None = None  # session_id 미지정 POST 라우팅용
+        self.prepared: dict[str, dict] = {}
+        self.last_active: str | None = None
         self.lock = asyncio.Lock()
 
     async def register(self, sid: str, ws: WebSocket):
         self.sockets[sid] = ws
         self.last_active = sid
+
+        existing = self.tts_sockets.get(sid)
+        if existing is not None and existing.state != State.CLOSED:
+            print(f"[{sid}] 기존 TTS Worker 연결 재사용 (프리웜)")
+            return
+        
         try:
             tts_ws = await websockets.connect(settings.tts_ws_url, max_size=None)
             self.tts_sockets[sid] = tts_ws
@@ -58,6 +66,7 @@ class Hub:
     async def unregister(self, sid: str):
         self.sockets.pop(sid, None)
         self.stt_sockets.pop(sid, None)
+        self.prepared.pop(sid, None)      
         tts_ws = self.tts_sockets.pop(sid, None)
         if tts_ws:
             try:
@@ -164,6 +173,67 @@ async def speak(sid: str, packet: BehaviorPacket):
         except Exception:
             pass
 
+async def _wait_stt_socket(sid: str, tries: int = 30):
+    """STT 워커 소켓이 붙을 때까지 최대 3초 대기(기존 speak와 동일 정책)."""
+    for _ in range(tries):
+        ws = hub.stt_sockets.get(sid)
+        if ws:
+            return ws
+        await asyncio.sleep(0.1)
+    return None
+
+
+async def speak_prepared(sid: str) -> bool:
+    """프리웜 단계에서 미리 합성해 둔 첫 발화를 즉시 흘려보낸다.
+    TTS 합성 대기가 0이므로 씬 진입 직후 바로 말하기 시작한다."""
+    data = hub.prepared.pop(sid, None)
+    if not data:
+        return False
+
+    packet: BehaviorPacket = data["packet"]
+    chunks: list = data["chunks"]
+
+    await hub.send_packet(sid, packet)
+    print(f"[{sid}] [프리웜 재생] {packet.dialogue} (chunks={len(chunks)})")
+
+    if settings.skip_tts or not chunks:
+        await hub.send_json(sid, {"type": "audio_end"})
+        stt_ws = hub.stt_sockets.get(sid)
+        if stt_ws:
+            try:
+                await stt_ws.send_json({"type": "end"})
+            except Exception:
+                pass
+        return True
+
+    stt_ws = await _wait_stt_socket(sid)
+
+    for chunk in chunks:
+        try:
+            if stt_ws:
+                if isinstance(chunk, bytes):
+                    await stt_ws.send_bytes(chunk)
+                else:
+                    await stt_ws.send_text(chunk)
+            else:
+                if isinstance(chunk, bytes):
+                    await hub.send_audio(sid, chunk)
+                else:
+                    ws_ctrl = hub.sockets.get(sid)
+                    if ws_ctrl:
+                        await ws_ctrl.send_text(chunk)
+        except Exception as e:
+            print(f"[{sid}] 프리웜 청크 전송 실패: {e}")
+            break
+        await asyncio.sleep(0)
+
+    await hub.send_json(sid, {"type": "audio_end"})
+    if stt_ws:
+        try:
+            await stt_ws.send_json({"type": "end"})
+        except Exception:
+            pass
+    return True
 
 # ---------------------------------------------------------------------------
 # WebSocket: Unity 제어 채널
@@ -180,16 +250,23 @@ async def ws_control(ws: WebSocket):
 
             if mtype == "init":
                 sid = msg.get("session_id") or "default"
-                hub.sessions[sid] = InterviewSession(
-                    session_id=sid,
-                    company=msg.get("company", ""),
-                    job_title=msg.get("job_title", ""),
-                    resume=msg.get("resume", ""),
-                )
+                prepared = hub.prepared.get(sid)
+
+                if prepared is None:
+                    hub.sessions[sid] = InterviewSession(
+                        session_id=sid,
+                        company=msg.get("company", ""),
+                        job_title=msg.get("job_title", ""),
+                        resume=msg.get("resume", ""),
+                    )
+
                 await hub.register(sid, ws)
-                # 면접관이 먼저 자기소개를 요청 (첫 발화 + 음성)
-                packet = await hub.sessions[sid].first_question()
-                await speak(sid, packet)
+
+                if prepared is not None:
+                    await speak_prepared(sid)
+                else:
+                    packet = await hub.sessions[sid].first_question()
+                    await speak(sid, packet)
 
             elif mtype == "utterance_end":
                 # (옵션) Unity가 STT를 거치지 않고 직접 피쳐만 보낼 때 집계.
@@ -243,6 +320,57 @@ async def process(req: AnswerRequest):
     await speak(sid, packet)
     return {"ok": True, "stage": packet.stage, "persona": packet.persona, "score": packet.score}
 
+@app.post("/session/prepare")
+async def session_prepare(req: InitRequest):
+    sid = req.session_id or "default"
+
+    # 이전 잔여 세션/캐시 정리 (Setup 재진입 대비)
+    hub.prepared.pop(sid, None)
+    hub.sessions.pop(sid, None)
+
+    session = InterviewSession(
+        session_id=sid,
+        company=req.company,
+        job_title=req.job_title,
+        resume=req.resume,
+    )
+    hub.sessions[sid] = session
+    hub.last_active = sid
+
+    if settings.template_first_question:
+        packet = session.template_first_question()
+    else:
+        packet = await session.first_question()
+
+    chunks: list = []
+    if not settings.skip_tts:
+        tts_ws = await hub.get_or_connect_tts_ws(sid)
+        if tts_ws:
+            try:
+                async for chunk in tts_client.synthesize_ws_stream(tts_ws, packet.dialogue):
+                    chunks.append(chunk)
+            except Exception as e:
+                print(f"[{sid}] [prepare] TTS 선합성 실패(런타임 합성으로 폴백): {e}")
+                chunks = []
+        else:
+            print(f"[{sid}] [prepare] TTS 소켓 없음 - 음성 캐시 생략")
+
+    hub.prepared[sid] = {"packet": packet, "chunks": chunks}
+
+    if settings.warmup_llm_on_prepare:
+        asyncio.create_task(llm.warmup())   # 응답을 막지 않도록 백그라운드
+
+    audio_bytes = sum(len(c) for c in chunks if isinstance(c, bytes))
+    print(f"[{sid}] [prepare] 완료 - dialogue='{packet.dialogue[:30]}...' "
+          f"chunks={len(chunks)} bytes={audio_bytes}")
+
+    return {
+        "ok": True,
+        "session_id": sid,
+        "dialogue": packet.dialogue,
+        "audio_chunks": len(chunks),
+        "audio_bytes": audio_bytes,
+    }
 
 @app.get("/health")
 async def health():

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 from . import llm
+from .config import settings     
 from .domain import (
     AnswerRequest,
     BehaviorPacket,
@@ -76,10 +77,47 @@ class InterviewSession:
         idx = STAGE_ORDER.index(self.stage)
         self.stage = STAGE_ORDER[min(idx + 1, len(STAGE_ORDER) - 1)]
 
+
     # ----- 핵심: 면접관의 다음 발화 생성 -----
+    FIRST_QUESTION_TEMPLATE = (
+        "안녕하세요. {company} {job} 직무 면접에 참여해 주셔서 감사합니다. "
+        "오늘 면접을 진행하게 된 면접관입니다. "
+        "먼저 {company} {job} 직무에 지원하신 동기와, "
+        "본인이 이 직무에 적합하다고 생각하는 이유를 포함해서 자기소개를 부탁드립니다."
+    )
+
+    def template_first_question(self) -> BehaviorPacket:
+        if self.stage == Stage.INIT:
+            self._advance_stage()
+
+        company = (self.company or "").strip().splitlines()[0] if self.company else ""
+        job = (self.job_title or "").strip().splitlines()[0] if self.job_title else ""
+        dialogue = self.FIRST_QUESTION_TEMPLATE.format(
+            company=company or "저희 회사",
+            job=job or "지원하신",
+        )
+
+        self._record("interviewer", dialogue)
+        return BehaviorPacket(
+            type="interviewer_turn",
+            session_id=self.session_id,
+            stage=self.stage.value,
+            persona=self.persona.value,
+            persona_value=0.0,
+            dialogue=dialogue,
+            expression_id=ExpressionID.WARM_SMILE.value,
+            gesture_id=GestureID.WELCOME.value,
+            score=-1,
+            is_final=False,
+        )
+
+
     async def first_question(self) -> BehaviorPacket:
         """면접 시작: 면접관이 먼저 자기소개를 요청하는 첫 발화."""
-        self._advance_stage()  # INIT -> SELF_INTRO
+        if settings.template_first_question:
+            return self.template_first_question()
+
+        self._advance_stage()
         turn = await llm.generate_turn(
             stage=self.stage, persona=self.persona,
             info=self.info, resume=self.resume,
