@@ -20,10 +20,9 @@ import asyncio
 import json
 import websockets
 from websockets.protocol import State
-
+from pydantic import BaseModel
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
-
 from .config import settings
 from .domain import AnswerRequest, BehaviorPacket, ExpressionID, GestureID
 from .session import InterviewSession
@@ -320,8 +319,14 @@ async def process(req: AnswerRequest):
     await speak(sid, packet)
     return {"ok": True, "stage": packet.stage, "persona": packet.persona, "score": packet.score}
 
+class PrepareRequest(BaseModel):
+    session_id: str = "default"
+    company: str = ""
+    job_title: str = ""
+    resume: str = ""
+
 @app.post("/session/prepare")
-async def session_prepare(req: InitRequest):
+async def session_prepare(req: PrepareRequest):
     sid = req.session_id or "default"
 
     # 이전 잔여 세션/캐시 정리 (Setup 재진입 대비)

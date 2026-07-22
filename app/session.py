@@ -80,10 +80,8 @@ class InterviewSession:
 
     # ----- 핵심: 면접관의 다음 발화 생성 -----
     FIRST_QUESTION_TEMPLATE = (
-        "안녕하세요. {company} {job} 직무 면접에 참여해 주셔서 감사합니다. "
-        "오늘 면접을 진행하게 된 면접관입니다. "
-        "먼저 {company} {job} 직무에 지원하신 동기와, "
-        "본인이 이 직무에 적합하다고 생각하는 이유를 포함해서 자기소개를 부탁드립니다."
+        "안녕하세요. {company} {job} 직무 면접을 시작하겠습니다. "
+        "먼저 지원 동기를 포함해 자기소개를 부탁드립니다."
     )
 
     def template_first_question(self) -> BehaviorPacket:
