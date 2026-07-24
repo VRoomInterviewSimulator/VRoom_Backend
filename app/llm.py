@@ -185,15 +185,19 @@ def _turn_instruction(stage: Stage, persona: Persona, history: str, user_answer:
         "(POSITIVE=안정감/미소, NEUTRAL=경청, NEGATIVE=압박/냉정)\n"
         f"[직전 지원자 답변] {user_answer or '(아직 없음 - 면접관이 먼저 말함)'}\n"
         f"[지금까지의 대화 요약]\n{history or '(없음)'}\n\n"
-        "아래 JSON 스키마로만 응답하라:\n"
+        "반드시 아래의 순수 JSON 형식으로만 응답하라. 설명이나 주석 기호 없이 JSON 괄호만 출력할 것:\n"
         "{\n"
         '  "dialogue": "면접관 대사(한국어)",\n'
-        '  "score": 정수(-1 또는 0~100; 채점 대상 아니면 -1),\n'
+        '  "score": 0,\n'
         '  "score_reason": "채점 근거 한 문장",\n'
-        f'  "expression_id": 정수(허용값: {allowed_expr}),\n'
-        f'  "gesture_id": 정수(허용값: {allowed_gest})\n'
-        "}\n"
-        "expression_id/gesture_id는 반드시 위 허용값 중에서만 고른다."
+        f'  "expression_id": 1\n'
+        f'  "gesture_id": 1\n'
+        "}\n\n"
+        "[데이터 작성 엄격 규칙]\n"
+        "- score: 채점 대상이 아닌 단계(인사 등)면 무조건 -1. 채점 대상이면 지원자 답변의 정확도를 평가하여 0~100 사이의 정수(int)만 기입할 것.\n"
+        f"- expression_id: 반드시 다음 정수 중 하나만 기입할 것 ({allowed_expr})\n"
+        f"- gesture_id: 반드시 다음 정수 중 하나만 기입할 것 ({allowed_gest})\n"
+        #"expression_id/gesture_id는 반드시 위 허용값 중에서만 고른다."
     )
 
 
@@ -207,9 +211,20 @@ async def generate_turn(
     for attempt in range(2):
         try:
             data = await _ask_json(system, user)
+
+            #LLM이 점수를 "80점", "80" 같은 문자열로 줬을 경우 숫자만 추출하는 방어 로직
+            if "score" in data and isinstance(data["score"], str):
+                import re
+                numbers = re.findall(r'-?\d+', data["score"])
+                if numbers:
+                    data["score"] = int(numbers[0])
+                else:
+                    data["score"] = -1
+
             turn = LLMTurn(**data)
             return _clamp_to_set(turn, persona)
-        except Exception:
+        except Exception as e:
+            print(f"[에러 발생] LLM 응답 파싱 실패: {e}, 받은 데이터: {data}")
             if attempt == 1:
                 return LLMTurn(
                     dialogue="네, 잘 들었습니다. 다음 질문으로 넘어가겠습니다.",
