@@ -26,7 +26,6 @@ class Settings(BaseSettings):
     template_first_question: bool = True   # True면 첫 질문은 LLM 없이 템플릿으로 생성
     warmup_llm_on_prepare: bool = True     # prepare 시 OpenAI 커넥션 예열(1토큰 요청)
 
-    # provider에 맞는 (base_url, api_key, model) 묶음을 돌려준다.
     def resolve_llm(self) -> tuple[str | None, str, str]:
         if self.llm_provider == "groq":
             return ("https://api.groq.com/openai/v1", self.groq_api_key, self.groq_model)
@@ -34,3 +33,59 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+class ScoringConfig:
+    """
+    비언어적 평가 항목(0~10점) 채점을 위한 조절 가능한 상수 모음
+    
+    [기본 점수 계산 원리]
+    각 평가 항목(Voice Volume, Speed, Answer Length, Response Time)은 전체 평균이 아닌
+    "매 턴(Turn)마다 개별적으로 점수(10점 만점 기준)를 산출한 뒤, 
+    이 턴별 점수들을 모두 더해 평균을 내는 방식"으로 최종 점수를 확정합니다.
+    턴별 기본 감점 공식: 10 - int(abs(해당 턴의 데이터 - MEAN) / TOLERANCE)
+    
+    [참고: Unity 클라이언트 설정(VoiceActivityDetector.cs)과의 관계]
+    백엔드는 유니티에서 1차 가공되어 넘어온 피쳐(Feature) 데이터를 기반으로 최종 감점만 수행합니다.
+    피쳐 데이터를 추출하는 원천 기준값 2개는 백엔드가 아닌 유니티 인스펙터에서 직접 조절해야 합니다.
+    - meaningfulPauseThreshold (기본 0.4초): 침묵이 몇 초 이상 지속되어야 '의미 있는 퍼즈(Pause)' 1회로 카운트할 것인가?
+    - lowVolumeRatioThreshold (기본 0.3): 특정 프레임의 볼륨이 '전체 평균 볼륨의 30% 이하'로 떨어질 때만 '작은 목소리'로 카운트.
+    
+    [기타 평가 항목 (LLM 정성 평가)]
+    아래 항목들은 수식(상수)에 의한 기계적 계산이 아닌, LLM의 정성 평가에 의해 0~10점 척도로 매겨집니다.
+    - Accuracy (답변 품질): 면접 중 각 턴마다 LLM이 평가한 질문 대비 답변 퀄리티 점수(0~100)를 10점 만점으로 환산한 전체 평균.
+    - Density Score (내용 밀도): 면접 종료 후 스크립트 전체를 보고 "쓸데없이 말만 길지 않고 핵심이 있는가"를 10점 만점으로 평가. 이 점수는 Answer Length(물리적 길이) 점수와 50:50 비중으로 합산되어 최종 답변 길이 점수가 됩니다.
+    - Filler Words (추임새): 면접 종료 후 스크립트에서 "어...", "그니까..." 등 불필요한 추임새 남용 여부를 10점 만점으로 평가.
+    """
+    
+    # 목소리 크기 (RMS)
+    # 공식: 10 - int(abs(평균볼륨 - VOICE_VOLUME_MEAN) / VOICE_VOLUME_TOLERANCE)
+    VOICE_VOLUME_MEAN = 0.1
+    VOICE_VOLUME_TOLERANCE = 0.05  # 오차가 이 범위를 초과할 때마다(계단식) 1점 감점
+    
+    # 페널티: 목소리의 분산(들쭉날쭉함)이 THRESHOLD를 넘으면 PENALTY만큼 추가 감점
+    VOLUME_VARIANCE_THRESHOLD = 0.05
+    VOLUME_VARIANCE_PENALTY = 1
+    
+    # 페널티: 목소리가 지나치게 작은 구간의 비율이 THRESHOLD(예: 30%)를 넘으면 PENALTY 감점
+    LOW_VOLUME_RATIO_THRESHOLD = 0.3
+    LOW_VOLUME_RATIO_PENALTY = 1
+    
+    # 발화 속도 (초당 글자 수 CPS)
+    # 공식: 10 - int(abs(평균속도 - VOICE_SPEED_MEAN) / VOICE_SPEED_TOLERANCE)
+    VOICE_SPEED_MEAN = 5.0
+    VOICE_SPEED_TOLERANCE = 1.0    # 허용 오차를 벗어날 때마다 1점 감점
+    
+    # 페널티: 한 턴당 의미 있는 퍼즈(침묵) 횟수가 허용치(ALLOWANCE)를 넘은 횟수만큼 추가 감점
+    PAUSE_ALLOWANCE = 1.0
+    
+    # 반응 속도 (초)
+    # 공식: 턴별로 10 - int(abs(실제응답시간 - 상황별 MEAN) / 1.5) 계산 후 전체 평균
+    RESPONSE_TIME_INTRO_MEAN = 1.5      # 자기소개 시 기대 응답시간
+    RESPONSE_TIME_FOLLOWUP_MEAN = 3.5   # 꼬리질문 시 기대 응답시간 (생각할 시간이 더 필요함)
+    RESPONSE_TIME_TOLERANCE = 1.5       # 이 범위를 벗어날 때마다 1점 감점
+    
+    # 이상적인 답변 길이 (초)
+    # 길이 미달 시: int((평균답변시간 / ANSWER_LENGTH_MIN) * 10) (예: 최소치의 절반만 답하면 5점)
+    # 길이 초과 시: 10 - int((평균답변시간 - ANSWER_LENGTH_MAX) / 10) (예: 최대치에서 10초 초과할 때마다 1점 감점)
+    ANSWER_LENGTH_MIN = 40
+    ANSWER_LENGTH_MAX = 80

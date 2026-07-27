@@ -56,7 +56,14 @@ class InterviewSession:
         self.turns: list[dict] = []          # {"role","stage","text"}
         self.stage_scores: list[tuple[str, int]] = []
         self.speaking_times: list[float] = []
-        self.total_pauses = 0
+        
+        self.cps_list: list[float] = []
+        self.meaningful_pauses: list[int] = []
+        self.volume_variances: list[float] = []
+        self.low_volume_ratios: list[float] = []
+        self.response_times: list[float] = []
+        self.average_volumes: list[float] = []
+        self.turn_stages: list[str] = []
 
     # ----- 메모리 -----
     def _history_text(self) -> str:
@@ -127,7 +134,8 @@ class InterviewSession:
     async def on_user_answer(self, text: str, features: dict) -> BehaviorPacket:
         """사용자 답변(STT 결과)을 받아 채점하고 다음 단계 발화를 생성."""
         self._record("user", text)
-        self._collect_features(features)
+        self.turn_stages.append(self.stage.value)
+        self._collect_features(features, text)
 
         # [1단계] 자기소개 답변이면 동적 페르소나 정보 추출 (1회).
         #  - 현재 단계가 SELF_INTRO == 방금 받은 답변이 자기소개라는 뜻.
@@ -194,29 +202,104 @@ class InterviewSession:
         )
 
     # ----- 멀티모달 피쳐 집계 -----
-    def _collect_features(self, features: dict):
+    def _collect_features(self, features: dict, text: str = ""):
         if not features:
             return
         st = features.get("speakingTime")
-        if isinstance(st, (int, float)):
+        if isinstance(st, (int, float)) and st > 0:
             self.speaking_times.append(float(st))
-        pc = features.get("pauseCount")
-        if isinstance(pc, (int, float)):
-            self.total_pauses += int(pc)
+            cps = len(text) / float(st)
+            self.cps_list.append(cps)
+            
+        self.meaningful_pauses.append(int(features.get("meaningfulPauseCount", features.get("pauseCount", 0))))
+        self.volume_variances.append(float(features.get("volumeVariance", 0.0)))
+        self.low_volume_ratios.append(float(features.get("lowVolumeRatio", 0.0)))
+        self.response_times.append(float(features.get("responseTime", 0.0)))
+        self.average_volumes.append(float(features.get("averageVolume", 0.1)))
 
     # ----- 종료 피드백 -----
     async def build_feedback(self) -> FeedbackReport:
-        avg_speak = (sum(self.speaking_times) / len(self.speaking_times)) if self.speaking_times else 0.0
+        from .config import ScoringConfig
+        
+        turn_count = len(self.speaking_times)
+        avg_speak = (sum(self.speaking_times) / turn_count) if turn_count > 0 else 0.0
+        total_pauses = sum(self.meaningful_pauses)
+        
         data = await llm.generate_feedback(
             company=self.info.company_name or self.company,
             job_title=self.info.job_role or self.job_title,
             transcript=self._history_text(), stage_scores=self.stage_scores,
-            avg_speaking_time=avg_speak, total_pauses=self.total_pauses,
+            avg_speaking_time=avg_speak, total_pauses=total_pauses,
         )
 
         scored = [v for _, v in self.stage_scores if v >= 0]
         accuracy10 = round((sum(scored) / len(scored)) / 10) if scored else 0
-        scores = InterviewScore(accuracy=accuracy10)
+        
+        total_vol_score = 0
+        total_speed_score = 0
+        total_length_score = 0
+        total_rt_score = 0
+
+        # 각 턴별로 개별 점수를 매기고 합산
+        for i in range(turn_count):
+            # 1. Voice Volume (턴별)
+            vol = self.average_volumes[i] if i < len(self.average_volumes) else ScoringConfig.VOICE_VOLUME_MEAN
+            var = self.volume_variances[i] if i < len(self.volume_variances) else 0.0
+            low = self.low_volume_ratios[i] if i < len(self.low_volume_ratios) else 0.0
+            
+            s_vol = 10 - int(abs(vol - ScoringConfig.VOICE_VOLUME_MEAN) / ScoringConfig.VOICE_VOLUME_TOLERANCE)
+            if var > ScoringConfig.VOLUME_VARIANCE_THRESHOLD: s_vol -= ScoringConfig.VOLUME_VARIANCE_PENALTY
+            if low > ScoringConfig.LOW_VOLUME_RATIO_THRESHOLD: s_vol -= ScoringConfig.LOW_VOLUME_RATIO_PENALTY
+            total_vol_score += max(0, min(10, s_vol))
+            
+            # 2. Voice Speed (턴별)
+            cps = self.cps_list[i] if i < len(self.cps_list) else ScoringConfig.VOICE_SPEED_MEAN
+            pauses = self.meaningful_pauses[i] if i < len(self.meaningful_pauses) else 0
+            
+            s_speed = 10 - int(abs(cps - ScoringConfig.VOICE_SPEED_MEAN) / ScoringConfig.VOICE_SPEED_TOLERANCE)
+            s_speed -= int(max(0, pauses - ScoringConfig.PAUSE_ALLOWANCE))
+            total_speed_score += max(0, min(10, s_speed))
+            
+            # 3. Answer Length (턴별 물리적 시간 점수)
+            st = self.speaking_times[i]
+            if st < ScoringConfig.ANSWER_LENGTH_MIN:
+                s_len = int((st / ScoringConfig.ANSWER_LENGTH_MIN) * 10)
+            elif st > ScoringConfig.ANSWER_LENGTH_MAX:
+                s_len = 10 - int((st - ScoringConfig.ANSWER_LENGTH_MAX) / 10)
+            else:
+                s_len = 10
+            total_length_score += max(0, min(10, s_len))
+            
+            # 4. Response Time (턴별)
+            rt = self.response_times[i] if i < len(self.response_times) else 0.0
+            stage = self.turn_stages[i] if i < len(self.turn_stages) else "UNKNOWN"
+            target_rt = ScoringConfig.RESPONSE_TIME_INTRO_MEAN if stage == "SELF_INTRO" else ScoringConfig.RESPONSE_TIME_FOLLOWUP_MEAN
+            
+            s_rt = 10 - int(abs(rt - target_rt) / ScoringConfig.RESPONSE_TIME_TOLERANCE)
+            total_rt_score += max(0, min(10, s_rt))
+
+        # 합산된 점수의 평균 산출 (턴이 없으면 기본 만점)
+        vol_score = round(total_vol_score / turn_count) if turn_count > 0 else 10
+        speed_score = round(total_speed_score / turn_count) if turn_count > 0 else 10
+        rt_score = round(total_rt_score / turn_count) if turn_count > 0 else 10
+        
+        # Answer Length 최종 산출: (턴별 물리적 시간 점수 평균 + LLM이 평가한 내용 밀도 점수) / 2
+        time_score_avg = round(total_length_score / turn_count) if turn_count > 0 else 10
+        density_score = data.get("density_score", 5)
+        length_score = (time_score_avg + density_score) // 2
+        length_score = max(0, min(10, length_score))
+        
+        # 5. Filler Words (LLM 평가)
+        filler_score = data.get("filler_score", 5)
+        
+        scores = InterviewScore(
+            accuracy=accuracy10,
+            voiceVolume=vol_score,
+            voiceSpeed=speed_score,
+            answerLength=length_score,
+            fillerWords=filler_score,
+            responseTime=rt_score
+        )
 
         overall = sum(scores.model_dump().values())
 
@@ -229,5 +312,5 @@ class InterviewSession:
             improvements=data.get("improvements", ""),
             summary=data.get("summary", ""),
             avg_speaking_time=round(avg_speak, 1),
-            total_pauses=self.total_pauses,
+            total_pauses=total_pauses,
         )

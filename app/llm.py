@@ -250,13 +250,16 @@ async def generate_feedback(*, company: str, job_title: str, transcript: str,
         f"평균 발화시간(초): {avg_speaking_time:.1f}, 총 침묵 횟수: {total_pauses}\n"
         f"단계별 점수: {stage_scores}\n"
         f"전체 대화 기록:\n{transcript}\n\n"
+        "추가 요구사항:\n"
+        "1) 전체 답변 텍스트를 분석하여 무의미한 필러 단어(어, 그, 뭐랄까 등)의 남용이나 말더듬 현상을 평가하여 'filler_score' (0~10점 정수)를 매기세요. (필러가 적을수록 10점)\n"
+        "2) 답변 내용의 충실도와 밀도(불필요하게 장황하지 않은지)를 평가하여 'density_score' (0~10점 정수)를 매기세요. (충실할수록 10점)\n\n"
         "다음 JSON으로만 응답:\n"
-        '{ "strengths": "강점 2~3문장", "improvements": "개선점 2~3문장", "summary": "총평 2문장" }'
+        '{ "strengths": "강점 2~3문장", "improvements": "개선점 2~3문장", "summary": "총평 2문장", "filler_score": 10, "density_score": 10 }'
     )
     try:
         data = await _ask_json(system, user)
     except Exception:
-        data = {"strengths": "", "improvements": "", "summary": ""}
+        data = {"strengths": "", "improvements": "", "summary": "", "filler_score": 5, "density_score": 5}
     data["overall_score"] = overall
     return data
 

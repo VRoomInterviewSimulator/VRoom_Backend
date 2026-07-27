@@ -239,9 +239,9 @@ async def speak_prepared(sid: str) -> bool:
 # ---------------------------------------------------------------------------
 @app.websocket("/ws/control")
 async def ws_control(ws: WebSocket):
-    await ws.accept()
     sid: str | None = None
     try:
+        await ws.accept()
         while True:
             raw = await ws.receive_text()
             msg = json.loads(raw)
@@ -273,12 +273,24 @@ async def ws_control(ws: WebSocket):
                     hub.sessions[sid]._collect_features(msg.get("features", {}))
 
             elif mtype == "request_feedback":
+                print(f"[ws_control] request_feedback 수신 (sid={sid})")
                 if sid and sid in hub.sessions:
-                    report = await hub.sessions[sid].build_feedback()
-                    await hub.send_json(sid, report.model_dump())
+                    try:
+                        report = await hub.sessions[sid].build_feedback()
+                        await hub.send_json(sid, report.model_dump())
+                        print(f"[ws_control] feedback_report 전송 완료 (sid={sid})")
+                    except Exception as e:
+                        print(f"[ws_control] build_feedback 에러: {e}")
+                        import traceback
+                        traceback.print_exc()
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError) as e:
+        print(f"[ws_control] WebSocket 연결 종료 ({sid}): {e}")
         pass
+    except Exception as e:
+        print(f"[ws_control] 예기치 않은 에러 ({sid}): {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         if sid:
             await hub.unregister(sid)
@@ -390,11 +402,11 @@ async def ws_tts(ws: WebSocket):
       - 면접관 대사를 진짜 TTS(/ws/tts)로 합성해 음성을 STT로 릴레이
     STT 입장에선 기존 TTS와 동일하게 (음성청크 + {"type":"end"}) 를 받는다.
     """
-    await ws.accept()
     sid = ws.query_params.get("session_id", "default")
-    hub.stt_sockets[sid] = ws
-    print(f"[/ws/tts] STT 워커 연결됨 - Session ID: {sid}")
     try:
+        await ws.accept()
+        hub.stt_sockets[sid] = ws
+        print(f"[/ws/tts] STT 워커 연결됨 - Session ID: {sid}")
         while True:
             raw = await ws.receive_text()
             msg = json.loads(raw)
@@ -444,7 +456,7 @@ async def ws_tts(ws: WebSocket):
             # 한 발화 끝 신호 (STT가 이걸 받고 Unity VAD 잠금 해제)
             await ws.send_json({"type": "end"})
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         print(f"[/ws/tts] STT 워커 연결 종료 - Session ID: {sid}")
     except Exception as e:
         print(f"[/ws/tts] Error for Session ID {sid}: {e}")
