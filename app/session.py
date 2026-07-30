@@ -371,11 +371,19 @@ class InterviewSession:
             p += max(0, min(10, s))
 
             # --- gesture ---
-            energy = t.get("handMotionEnergy", 0.0)
-            s = 10 - int(abs(energy - V.GESTURE_IDEAL_ENERGY)
-                         / V.GESTURE_ENERGY_TOLERANCE)
-            if t.get("handVisibleRatio", 1.0) < V.GESTURE_VISIBLE_MIN:
-                s -= V.GESTURE_HIDDEN_PENALTY
+            u = t.get("handUsageRatio", 0.0)
+            if u <= V.GESTURE_USAGE_HARD_ZERO:
+                s = 0                       # 면접 내내 손을 전혀 쓰지 않음
+            elif u < V.GESTURE_USAGE_MIN:
+                s = 10 - int((V.GESTURE_USAGE_MIN - u) / V.GESTURE_UNDER_STEP)
+            elif u > V.GESTURE_USAGE_MAX:
+                s = 10 - int((u - V.GESTURE_USAGE_MAX) / V.GESTURE_OVER_STEP)
+            else:
+                s = 10
+            # 손이 보이지만 한 자리에 굳어 있으면 감점
+            if u >= V.GESTURE_USAGE_MIN and \
+                    t.get("handExtent", 0.0) < V.GESTURE_EXTENT_MIN:
+                s -= V.GESTURE_EXTENT_PENALTY
             s -= max(0, t.get("faceTouchCount", 0) - V.GESTURE_FACE_TOUCH_ALLOWANCE)
             ge += max(0, min(10, s))
 

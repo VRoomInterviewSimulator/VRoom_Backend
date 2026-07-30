@@ -117,12 +117,15 @@ class VisionScoringConfig:
     POSTURE_DRIFT_TOLERANCE = 0.15  # 캘리브레이션 기준 대비 몸통 중심 이탈
     POSTURE_DRIFT_STEP = 0.10
 
-    # ---- 3. 손짓 (gesture) ----
-    GESTURE_IDEAL_ENERGY = 0.35     # 초당 손목 이동량(어깨너비 배수). 너무 적어도 많아도 감점
-    GESTURE_ENERGY_TOLERANCE = 0.20
-    GESTURE_VISIBLE_MIN = 0.60      # 손이 프레임에 잡힌 비율 하한
-    GESTURE_HIDDEN_PENALTY = 2
-    GESTURE_FACE_TOUCH_ALLOWANCE = 1  # 턴당 얼굴 만지기 허용 횟수(초과분마다 1점 감점)
+    # ---- 3. 손짓 = 손 사용 빈도(gesture) ----
+    GESTURE_USAGE_MIN = 0.15      # 이 미만 = 손을 거의 안 씀(경직)
+    GESTURE_USAGE_MAX = 0.65      # 이 초과 = 과도한 손짓
+    GESTURE_USAGE_HARD_ZERO = 0.02  # 완전 미사용 (0점 처리)
+    GESTURE_UNDER_STEP = 0.05     # 하한 미달분이 이만큼 늘 때마다 1점 감점
+    GESTURE_OVER_STEP = 0.15      # 상한 초과분이 이만큼 늘 때마다 1점 감점
+    GESTURE_EXTENT_MIN = 0.15     # 손이 보이지만 한 자리에 굳어 있으면 감점
+    GESTURE_EXTENT_PENALTY = 1
+    GESTURE_FACE_TOUCH_ALLOWANCE = 1   # 턴당 얼굴 만지기 허용 횟수
 
     # ---- 4. 표정 (expression) ----
     EXPRESSION_RIGID_THRESHOLD = 0.020  # 표정 변화량이 이 이하이면 '굳은 표정'
