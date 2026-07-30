@@ -102,25 +102,29 @@ class VisionScoringConfig:
     """
     # 이 비율 미만으로 얼굴이 검출된 턴은 신뢰 불가로 채점에서 제외
     MIN_FACE_RATIO = 0.5
+    MIN_POSE_RATIO = 0.5
+    UNMEASURABLE_SCORE = 5
 
     # ---- 1. 시선 (gaze) ----
     GAZE_RATIO_FULL = 0.80        # 정면 응시 비율이 이 이상이면 만점
     GAZE_RATIO_ZERO = 0.30        # 이 이하이면 0점 (사이는 선형 보간)
-    GAZE_JITTER_TOLERANCE = 6.0   # 두부 각도 표준편차(deg) 허용치
-    GAZE_JITTER_STEP = 3.0        # 초과분이 이만큼 늘 때마다 1점 감점
+    GAZE_JITTER_TOLERANCE = 5.0   # 두부 각도 표준편차(deg) 허용치
+    GAZE_JITTER_STEP = 2.5      # 초과분이 이만큼 늘 때마다 1점 감점
 
     # ---- 2. 자세 (posture) ----
-    POSTURE_TILT_TOLERANCE = 5.0    # 어깨 기울기 평균(deg)
+    POSTURE_TILT_TOLERANCE = 8.0    # 어깨 기울기 평균(deg)
     POSTURE_TILT_STEP = 3.0
-    POSTURE_SWAY_TOLERANCE = 0.08   # 어깨너비 정규화 상체 흔들림 표준편차
-    POSTURE_SWAY_STEP = 0.05
-    POSTURE_DRIFT_TOLERANCE = 0.15  # 캘리브레이션 기준 대비 몸통 중심 이탈
+    POSTURE_SWAY_TOLERANCE = 0.030   # 어깨너비 정규화 상체 흔들림 표준편차
+    POSTURE_SWAY_STEP = 0.020
+    POSTURE_DRIFT_ENABLED = False
+    POSTURE_DRIFT_TOLERANCE = 0.25
     POSTURE_DRIFT_STEP = 0.10
 
     # ---- 3. 손짓 = 손 사용 빈도(gesture) ----
+    GESTURE_USAGE_HARD_ZERO = 0.02
+    GESTURE_ZERO_SCORE = 2   
     GESTURE_USAGE_MIN = 0.15      # 이 미만 = 손을 거의 안 씀(경직)
-    GESTURE_USAGE_MAX = 0.65      # 이 초과 = 과도한 손짓
-    GESTURE_USAGE_HARD_ZERO = 0.02  # 완전 미사용 (0점 처리)
+    GESTURE_USAGE_MAX = 0.75      # 이 초과 = 과도한 손짓
     GESTURE_UNDER_STEP = 0.05     # 하한 미달분이 이만큼 늘 때마다 1점 감점
     GESTURE_OVER_STEP = 0.15      # 상한 초과분이 이만큼 늘 때마다 1점 감점
     GESTURE_EXTENT_MIN = 0.15     # 손이 보이지만 한 자리에 굳어 있으면 감점
@@ -128,7 +132,7 @@ class VisionScoringConfig:
     GESTURE_FACE_TOUCH_ALLOWANCE = 1   # 턴당 얼굴 만지기 허용 횟수
 
     # ---- 4. 표정 (expression) ----
-    EXPRESSION_RIGID_THRESHOLD = 0.020  # 표정 변화량이 이 이하이면 '굳은 표정'
+    EXPRESSION_RIGID_THRESHOLD = 0.012  # 표정 변화량이 이 이하이면 '굳은 표정'
     EXPRESSION_RIGID_PENALTY = 2
     EXPRESSION_FROWN_TOLERANCE = 0.15   # 찌푸림 프레임 비율 허용치
     EXPRESSION_FROWN_STEP = 0.15
@@ -136,3 +140,4 @@ class VisionScoringConfig:
     EXPRESSION_BLINK_MAX = 32.0         # 상한 (긴장)
     EXPRESSION_BLINK_STEP = 10.0
     EXPRESSION_SMILE_BONUS_RATIO = 0.15 # 이 이상 미소 유지 시 +1
+    EXPRESSION_BLINK_ENABLED = False

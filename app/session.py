@@ -373,7 +373,7 @@ class InterviewSession:
             # --- gesture ---
             u = t.get("handUsageRatio", 0.0)
             if u <= V.GESTURE_USAGE_HARD_ZERO:
-                s = 0                       # 면접 내내 손을 전혀 쓰지 않음
+                s = V.GESTURE_ZERO_SCORE
             elif u < V.GESTURE_USAGE_MIN:
                 s = 10 - int((V.GESTURE_USAGE_MIN - u) / V.GESTURE_UNDER_STEP)
             elif u > V.GESTURE_USAGE_MAX:
@@ -393,11 +393,12 @@ class InterviewSession:
                 s -= V.EXPRESSION_RIGID_PENALTY
             s -= int(max(0.0, t.get("frownRatio", 0.0)
                          - V.EXPRESSION_FROWN_TOLERANCE) / V.EXPRESSION_FROWN_STEP)
-            bpm = t.get("blinkPerMinute", 15.0)
-            if bpm > V.EXPRESSION_BLINK_MAX:
-                s -= int((bpm - V.EXPRESSION_BLINK_MAX) / V.EXPRESSION_BLINK_STEP)
-            elif bpm < V.EXPRESSION_BLINK_MIN:
-                s -= 1
+            if V.EXPRESSION_BLINK_ENABLED:
+                bpm = t.get("blinkPerMinute", 15.0)
+                if bpm > V.EXPRESSION_BLINK_MAX:
+                    s -= int((bpm - V.EXPRESSION_BLINK_MAX) / V.EXPRESSION_BLINK_STEP)
+                elif bpm < V.EXPRESSION_BLINK_MIN:
+                    s -= 1
             if t.get("smileRatio", 0.0) >= V.EXPRESSION_SMILE_BONUS_RATIO:
                 s += 1
             e += max(0, min(10, s))
