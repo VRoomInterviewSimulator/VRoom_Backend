@@ -89,3 +89,47 @@ class ScoringConfig:
     # 길이 초과 시: 10 - int((평균답변시간 - ANSWER_LENGTH_MAX) / 10) (예: 최대치에서 10초 초과할 때마다 1점 감점)
     ANSWER_LENGTH_MIN = 40
     ANSWER_LENGTH_MAX = 80
+
+class VisionScoringConfig:
+    """
+    웹캠 기반 비언어적 평가 항목(gaze / gesture / posture / expression) 채점 상수.
+
+    [역할 분담]
+    - Vision Worker(aggregator.py) : 프레임 -> 원시 피쳐 1차 가공 (임계값은 그쪽 상수)
+    - 이 클래스                    : 원시 피쳐 -> 0~10점 감점 (실험 튜닝은 여기서만)
+
+    음성 항목과 동일하게 '턴별로 점수를 매기고 전체 평균' 방식을 사용한다.
+    """
+    # 이 비율 미만으로 얼굴이 검출된 턴은 신뢰 불가로 채점에서 제외
+    MIN_FACE_RATIO = 0.5
+
+    # ---- 1. 시선 (gaze) ----
+    GAZE_RATIO_FULL = 0.80        # 정면 응시 비율이 이 이상이면 만점
+    GAZE_RATIO_ZERO = 0.30        # 이 이하이면 0점 (사이는 선형 보간)
+    GAZE_JITTER_TOLERANCE = 6.0   # 두부 각도 표준편차(deg) 허용치
+    GAZE_JITTER_STEP = 3.0        # 초과분이 이만큼 늘 때마다 1점 감점
+
+    # ---- 2. 자세 (posture) ----
+    POSTURE_TILT_TOLERANCE = 5.0    # 어깨 기울기 평균(deg)
+    POSTURE_TILT_STEP = 3.0
+    POSTURE_SWAY_TOLERANCE = 0.08   # 어깨너비 정규화 상체 흔들림 표준편차
+    POSTURE_SWAY_STEP = 0.05
+    POSTURE_DRIFT_TOLERANCE = 0.15  # 캘리브레이션 기준 대비 몸통 중심 이탈
+    POSTURE_DRIFT_STEP = 0.10
+
+    # ---- 3. 손짓 (gesture) ----
+    GESTURE_IDEAL_ENERGY = 0.35     # 초당 손목 이동량(어깨너비 배수). 너무 적어도 많아도 감점
+    GESTURE_ENERGY_TOLERANCE = 0.20
+    GESTURE_VISIBLE_MIN = 0.60      # 손이 프레임에 잡힌 비율 하한
+    GESTURE_HIDDEN_PENALTY = 2
+    GESTURE_FACE_TOUCH_ALLOWANCE = 1  # 턴당 얼굴 만지기 허용 횟수(초과분마다 1점 감점)
+
+    # ---- 4. 표정 (expression) ----
+    EXPRESSION_RIGID_THRESHOLD = 0.020  # 표정 변화량이 이 이하이면 '굳은 표정'
+    EXPRESSION_RIGID_PENALTY = 2
+    EXPRESSION_FROWN_TOLERANCE = 0.15   # 찌푸림 프레임 비율 허용치
+    EXPRESSION_FROWN_STEP = 0.15
+    EXPRESSION_BLINK_MIN = 8.0          # 분당 눈깜빡임 정상 하한 (응시 경직)
+    EXPRESSION_BLINK_MAX = 32.0         # 상한 (긴장)
+    EXPRESSION_BLINK_STEP = 10.0
+    EXPRESSION_SMILE_BONUS_RATIO = 0.15 # 이 이상 미소 유지 시 +1

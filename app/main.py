@@ -462,3 +462,22 @@ async def ws_tts(ws: WebSocket):
         print(f"[/ws/tts] Error for Session ID {sid}: {e}")
     finally:
         hub.stt_sockets.pop(sid, None)
+
+class VisionRequest(BaseModel):
+    session_id: str = ""
+    features: dict = {}
+
+
+@app.post("/vision")
+async def vision(req: VisionRequest):
+    """Vision Worker(Node C)가 턴 단위 시각 피쳐를 POST 하는 엔드포인트."""
+    sid = req.session_id or hub.last_active or "default"
+    session = hub.sessions.get(sid)
+    if session is None:
+        return JSONResponse({"error": "no active session"}, status_code=409)
+
+    session.collect_vision_features(req.features)
+    print(f"[Vision→백엔드] stage={req.features.get('stage')} "
+          f"gaze={req.features.get('gazeOnTargetRatio')} "
+          f"sway={req.features.get('bodySwayStd')}")
+    return {"ok": True, "collected": len(session.vision_turns)}

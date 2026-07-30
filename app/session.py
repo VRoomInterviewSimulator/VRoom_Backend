@@ -64,6 +64,7 @@ class InterviewSession:
         self.response_times: list[float] = []
         self.average_volumes: list[float] = []
         self.turn_stages: list[str] = []
+        self.vision_turns: list[dict] = []
 
     # ----- 메모리 -----
     def _history_text(self) -> str:
@@ -292,16 +293,28 @@ class InterviewSession:
         # 5. Filler Words (LLM 평가)
         filler_score = data.get("filler_score", 5)
         
+        vision_ok, gaze_s, gesture_s, posture_s, expr_s = self._score_vision()
+
         scores = InterviewScore(
             accuracy=accuracy10,
             voiceVolume=vol_score,
             voiceSpeed=speed_score,
             answerLength=length_score,
             fillerWords=filler_score,
-            responseTime=rt_score
+            responseTime=rt_score,
+            gaze=gaze_s,
+            gesture=gesture_s,
+            posture=posture_s,
+            expression=expr_s,
         )
 
-        overall = sum(scores.model_dump().values())
+        if vision_ok:
+            overall = sum(scores.model_dump().values())      # 10항목 / 100점
+        else:
+            # 웹캠 미사용 세션: 음성 6항목(60점 만점)을 100점으로 환산
+            voice_sum = (accuracy10 + vol_score + speed_score
+                         + length_score + filler_score + rt_score)
+            overall = round(voice_sum / 60 * 100)
 
         return FeedbackReport(
             session_id=self.session_id,
@@ -314,3 +327,72 @@ class InterviewSession:
             avg_speaking_time=round(avg_speak, 1),
             total_pauses=total_pauses,
         )
+
+    # ----- 시각(웹캠) 피쳐 -----
+    def collect_vision_features(self, features: dict):
+        if features:
+            self.vision_turns.append(features)
+
+    def _score_vision(self) -> tuple[bool, int, int, int, int]:
+        """(사용가능여부, gaze, gesture, posture, expression)"""
+        import math
+        from .config import VisionScoringConfig as V
+
+        turns = [t for t in self.vision_turns
+                 if t.get("faceDetectedRatio", 0.0) >= V.MIN_FACE_RATIO]
+        if not turns:
+            print("[채점] 유효한 시각 피쳐 없음 -> 시각 4항목 제외")
+            return (False, 0, 0, 0, 0)
+
+        g = ge = p = e = 0
+        for t in turns:
+            # --- gaze ---
+            r = t.get("gazeOnTargetRatio", 0.0)
+            if r >= V.GAZE_RATIO_FULL:
+                s = 10
+            elif r <= V.GAZE_RATIO_ZERO:
+                s = 0
+            else:
+                s = round(10 * (r - V.GAZE_RATIO_ZERO)
+                          / (V.GAZE_RATIO_FULL - V.GAZE_RATIO_ZERO))
+            jitter = math.hypot(t.get("headYawStd", 0.0), t.get("headPitchStd", 0.0))
+            s -= int(max(0.0, jitter - V.GAZE_JITTER_TOLERANCE) / V.GAZE_JITTER_STEP)
+            g += max(0, min(10, s))
+
+            # --- posture ---
+            s = 10
+            s -= int(max(0.0, t.get("shoulderTiltMean", 0.0)
+                         - V.POSTURE_TILT_TOLERANCE) / V.POSTURE_TILT_STEP)
+            s -= int(max(0.0, t.get("bodySwayStd", 0.0)
+                         - V.POSTURE_SWAY_TOLERANCE) / V.POSTURE_SWAY_STEP)
+            if t.get("calibrated"):
+                s -= int(max(0.0, t.get("torsoDriftMean", 0.0)
+                             - V.POSTURE_DRIFT_TOLERANCE) / V.POSTURE_DRIFT_STEP)
+            p += max(0, min(10, s))
+
+            # --- gesture ---
+            energy = t.get("handMotionEnergy", 0.0)
+            s = 10 - int(abs(energy - V.GESTURE_IDEAL_ENERGY)
+                         / V.GESTURE_ENERGY_TOLERANCE)
+            if t.get("handVisibleRatio", 1.0) < V.GESTURE_VISIBLE_MIN:
+                s -= V.GESTURE_HIDDEN_PENALTY
+            s -= max(0, t.get("faceTouchCount", 0) - V.GESTURE_FACE_TOUCH_ALLOWANCE)
+            ge += max(0, min(10, s))
+
+            # --- expression ---
+            s = 10
+            if t.get("expressionVariance", 0.0) < V.EXPRESSION_RIGID_THRESHOLD:
+                s -= V.EXPRESSION_RIGID_PENALTY
+            s -= int(max(0.0, t.get("frownRatio", 0.0)
+                         - V.EXPRESSION_FROWN_TOLERANCE) / V.EXPRESSION_FROWN_STEP)
+            bpm = t.get("blinkPerMinute", 15.0)
+            if bpm > V.EXPRESSION_BLINK_MAX:
+                s -= int((bpm - V.EXPRESSION_BLINK_MAX) / V.EXPRESSION_BLINK_STEP)
+            elif bpm < V.EXPRESSION_BLINK_MIN:
+                s -= 1
+            if t.get("smileRatio", 0.0) >= V.EXPRESSION_SMILE_BONUS_RATIO:
+                s += 1
+            e += max(0, min(10, s))
+
+        n = len(turns)
+        return (True, round(g / n), round(ge / n), round(p / n), round(e / n))
