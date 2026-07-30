@@ -5,6 +5,7 @@
 - 점수 -> 페르소나(긍정/중립/부정) 가변 전환 + 연속 저점 시 압박 고착
 - 대화 기록(메모리) 누적
 - 멀티모달 피쳐(발화시간/침묵 등) 집계
+- 웹캠 시각 피쳐(시선/손짓/자세/표정) 집계 및 채점
 - 종료 시 피드백 산출
 을 담당한다.
 
@@ -293,6 +294,7 @@ class InterviewSession:
         # 5. Filler Words (LLM 평가)
         filler_score = data.get("filler_score", 5)
         
+        # 6. 시각(웹캠) 항목
         vision_ok, gaze_s, gesture_s, posture_s, expr_s = self._score_vision()
 
         scores = InterviewScore(
@@ -334,7 +336,12 @@ class InterviewSession:
             self.vision_turns.append(features)
 
     def _score_vision(self) -> tuple[bool, int, int, int, int]:
-        """(사용가능여부, gaze, gesture, posture, expression)"""
+        """(사용가능여부, gaze, gesture, posture, expression)
+
+        Vision Worker(aggregator.py)가 프레임 -> 원시 피쳐를 1차 가공하고,
+        여기서는 VisionScoringConfig 상수로 감점만 수행한다.
+        음성 항목과 동일하게 '턴별 점수를 매기고 전체 평균' 방식.
+        """
         import math
         from .config import VisionScoringConfig as V
 
@@ -346,6 +353,10 @@ class InterviewSession:
 
         g = ge = p = e = 0
         for t in turns:
+            # pose 미검출 턴은 손짓/자세를 측정할 수 없다.
+            # 감점하지 않고 중립 처리 (측정 실패를 사용자 탓으로 돌리지 않음)
+            pose_ok = t.get("poseDetectedRatio", 0.0) >= V.MIN_POSE_RATIO   # ✅ 추가
+
             # --- gaze ---
             r = t.get("gazeOnTargetRatio", 0.0)
             if r >= V.GAZE_RATIO_FULL:
@@ -360,31 +371,39 @@ class InterviewSession:
             g += max(0, min(10, s))
 
             # --- posture ---
-            s = 10
-            s -= int(max(0.0, t.get("shoulderTiltMean", 0.0)
-                         - V.POSTURE_TILT_TOLERANCE) / V.POSTURE_TILT_STEP)
-            s -= int(max(0.0, t.get("bodySwayStd", 0.0)
-                         - V.POSTURE_SWAY_TOLERANCE) / V.POSTURE_SWAY_STEP)
-            if t.get("calibrated"):
-                s -= int(max(0.0, t.get("torsoDriftMean", 0.0)
-                             - V.POSTURE_DRIFT_TOLERANCE) / V.POSTURE_DRIFT_STEP)
-            p += max(0, min(10, s))
-
-            # --- gesture ---
-            u = t.get("handUsageRatio", 0.0)
-            if u <= V.GESTURE_USAGE_HARD_ZERO:
-                s = V.GESTURE_ZERO_SCORE
-            elif u < V.GESTURE_USAGE_MIN:
-                s = 10 - int((V.GESTURE_USAGE_MIN - u) / V.GESTURE_UNDER_STEP)
-            elif u > V.GESTURE_USAGE_MAX:
-                s = 10 - int((u - V.GESTURE_USAGE_MAX) / V.GESTURE_OVER_STEP)
+            if not pose_ok:                                                
+                s = V.UNMEASURABLE_SCORE
             else:
                 s = 10
-            # 손이 보이지만 한 자리에 굳어 있으면 감점
-            if u >= V.GESTURE_USAGE_MIN and \
-                    t.get("handExtent", 0.0) < V.GESTURE_EXTENT_MIN:
-                s -= V.GESTURE_EXTENT_PENALTY
-            s -= max(0, t.get("faceTouchCount", 0) - V.GESTURE_FACE_TOUCH_ALLOWANCE)
+                s -= int(max(0.0, t.get("shoulderTiltMean", 0.0)
+                             - V.POSTURE_TILT_TOLERANCE) / V.POSTURE_TILT_STEP)
+                s -= int(max(0.0, t.get("bodySwayStd", 0.0)
+                             - V.POSTURE_SWAY_TOLERANCE) / V.POSTURE_SWAY_STEP)
+                # torsoDrift 는 턴 길이에 비례해 커지는 시간 경과 편향이 있어
+                # 기본 비활성. CSV 에는 계속 기록된다.
+                if V.POSTURE_DRIFT_ENABLED and t.get("calibrated"):        
+                    s -= int(max(0.0, t.get("torsoDriftMean", 0.0)
+                                 - V.POSTURE_DRIFT_TOLERANCE) / V.POSTURE_DRIFT_STEP)
+            p += max(0, min(10, s))
+
+            # --- gesture (손 사용 빈도) ---
+            if not pose_ok:                                                
+                s = V.UNMEASURABLE_SCORE
+            else:
+                u = t.get("handUsageRatio", 0.0)
+                if u <= V.GESTURE_USAGE_HARD_ZERO:
+                    s = V.GESTURE_ZERO_SCORE
+                elif u < V.GESTURE_USAGE_MIN:
+                    s = 10 - int((V.GESTURE_USAGE_MIN - u) / V.GESTURE_UNDER_STEP)
+                elif u > V.GESTURE_USAGE_MAX:
+                    s = 10 - int((u - V.GESTURE_USAGE_MAX) / V.GESTURE_OVER_STEP)
+                else:
+                    s = 10
+                # 손이 보이지만 한 자리에 굳어 있으면 감점
+                if u >= V.GESTURE_USAGE_MIN and \
+                        t.get("handExtent", 0.0) < V.GESTURE_EXTENT_MIN:
+                    s -= V.GESTURE_EXTENT_PENALTY
+                s -= max(0, t.get("faceTouchCount", 0) - V.GESTURE_FACE_TOUCH_ALLOWANCE)
             ge += max(0, min(10, s))
 
             # --- expression ---
@@ -393,6 +412,7 @@ class InterviewSession:
                 s -= V.EXPRESSION_RIGID_PENALTY
             s -= int(max(0.0, t.get("frownRatio", 0.0)
                          - V.EXPRESSION_FROWN_TOLERANCE) / V.EXPRESSION_FROWN_STEP)
+            # 눈깜빡임: 10fps 에서 감은 구간(100~150ms)을 놓쳐 신뢰 불가 -> 기본 비활성
             if V.EXPRESSION_BLINK_ENABLED:
                 bpm = t.get("blinkPerMinute", 15.0)
                 if bpm > V.EXPRESSION_BLINK_MAX:
