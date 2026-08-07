@@ -16,7 +16,7 @@
 
 | 담당 | PC | 실행 프로그램 | 포트 |
 |:--|:--|:--|:--|
-| **프론트 담당** | PC-A (Tailscale 설치된 데스크탑) | Unity(프론트) + FastAPI 백엔드 | 백엔드 8080 |
+| **프론트 담당** |  PC-A 또는 클라이언트 노트북 | Unity(프론트) + Vision 워커(vision_process) + FastAPI 백엔드 | Vision 워커 8002, 백엔드 8080 |
 | **음성 처리 담당** | PC-B | STT 워커(Node A) + TTS 워커(Node B), Docker | STT 8000, TTS 8001 |
 | **LLM 담당** | — | **별도 서버 없음.** 백엔드가 OpenAI API를 직접 호출 | — |
 
@@ -184,12 +184,17 @@ STT/TTS는 컨테이너 안에서 도므로, 컨테이너 포트가 **호스트 
 2. STT 워커 컨테이너 기동 → `Uvicorn running on http://0.0.0.0:8000`
 
 **프론트 담당(PC-A):**
-3. 백엔드 기동:
+3. Vision 워커 기동 
+   ```bash
+   uvicorn server:app --host 0.0.0.0 --port 8002
+   ```
+   → `http://127.0.0.1:8002/health` 가 `{"ok":true,...,"backend":"http://127.0.0.1:8080","camera":true}`
+4. 백엔드 기동
    ```bash
    uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
    ```
    → `http://127.0.0.1:8080/health` 가 `{"status":"ok","provider":"openai",...}`
-4. Unity 실행 후 **Play**
+5. Unity 실행 후 **Play**
 
 ---
 
