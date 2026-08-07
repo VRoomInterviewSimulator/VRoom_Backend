@@ -312,6 +312,7 @@ async def process(req: AnswerRequest):
     # '생각 중' 더미 모션을 즉시 띄워 인지적 대기시간을 가린다 (RTT 제어).
     await hub.send_packet(sid, BehaviorPacket(
         type="thinking", session_id=sid, stage=session.stage.value,
+        persona=session.persona.value, persona_value=session.last_persona_value,
         dialogue="", expression_id=ExpressionID.THINKING.value,
         gesture_id=GestureID.REVIEW_RESUME.value, score=-1,
     ))
@@ -426,6 +427,7 @@ async def ws_tts(ws: WebSocket):
             # '생각 중' 모션을 Unity로 먼저
             await hub.send_packet(msg_sid, BehaviorPacket(
                 type="thinking", session_id=msg_sid, stage=session.stage.value,
+                persona=session.persona.value, persona_value=session.last_persona_value, 
                 dialogue="", expression_id=ExpressionID.THINKING.value,
                 gesture_id=GestureID.REVIEW_RESUME.value, score=-1,
             ))

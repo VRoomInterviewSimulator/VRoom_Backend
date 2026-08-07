@@ -53,7 +53,8 @@ class InterviewSession:
         self.stage: Stage = Stage.INIT
         self.persona: Persona = Persona.NEUTRAL
         self.consecutive_low = 0  # 연속 저점 카운트 (압박 고착용)
-
+        self.last_persona_value = 0.0
+        
         self.turns: list[dict] = []          # {"role","stage","text"}
         self.stage_scores: list[tuple[str, int]] = []
         self.speaking_times: list[float] = []
@@ -105,6 +106,7 @@ class InterviewSession:
         )
 
         self._record("interviewer", dialogue)
+        self.last_persona_value = 0.0 
         return BehaviorPacket(
             type="interviewer_turn",
             session_id=self.session_id,
@@ -135,6 +137,16 @@ class InterviewSession:
 
     async def on_user_answer(self, text: str, features: dict) -> BehaviorPacket:
         """사용자 답변(STT 결과)을 받아 채점하고 다음 단계 발화를 생성."""
+        # 면접 종료 후 들어온 발화는 무시 (결과 화면에서의 혼잣말 등)
+        if self.stage == Stage.DONE:
+            print(f"[{self.session_id}] 면접 종료 후 발화 수신 - 무시: {text[:30]}")
+            return BehaviorPacket(
+                type="ignored", session_id=self.session_id, stage=Stage.DONE.value,
+                persona=self.persona.value, persona_value=self.last_persona_value,
+                dialogue="", expression_id=ExpressionID.NEUTRAL.value,
+                gesture_id=GestureID.IDLE.value, score=-1, is_final=False,
+            )
+        
         self._record("user", text)
         self.turn_stages.append(self.stage.value)
         self._collect_features(features, text)
@@ -161,6 +173,7 @@ class InterviewSession:
             closing = BehaviorPacket(
                 session_id=self.session_id, stage=Stage.DONE.value,
                 persona=self.persona.value,
+                persona_value=self.last_persona_value,
                 dialogue="면접에 응해 주셔서 감사합니다. 잠시 후 결과를 안내해 드리겠습니다.",
                 expression_id=ExpressionID.WARM_SMILE.value,
                 gesture_id=GestureID.DEEP_NOD.value, score=-1, is_final=True,
@@ -191,11 +204,13 @@ class InterviewSession:
         return self._to_packet(turn, is_final=False)
 
     def _to_packet(self, turn: LLMTurn, is_final: bool) -> BehaviorPacket:
+        pv = persona_value_from_score(turn.score, self.consecutive_low)
+        self.last_persona_value = pv
         return BehaviorPacket(
             session_id=self.session_id,
             stage=self.stage.value,
             persona=self.persona.value,
-            persona_value=persona_value_from_score(turn.score, self.consecutive_low),
+            persona_value=pv,
             dialogue=turn.dialogue,
             expression_id=turn.expression_id,
             gesture_id=turn.gesture_id,
@@ -351,6 +366,15 @@ class InterviewSession:
             print("[채점] 유효한 시각 피쳐 없음 -> 시각 4항목 제외")
             return (False, 0, 0, 0, 0)
 
+        best: dict[str, dict] = {}
+        for t in turns:
+            key = t.get("stage", "")
+            if key not in best or t.get("frameCount", 0) > best[key].get("frameCount", 0):
+                best[key] = t
+        if len(best) < len(turns):
+            print(f"[채점] 시각 턴 중복 제거: {len(turns)} -> {len(best)}")
+        turns = list(best.values())
+        
         g = ge = p = e = 0
         for t in turns:
             # pose 미검출 턴은 손짓/자세를 측정할 수 없다.
