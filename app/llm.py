@@ -142,18 +142,28 @@ def _clamp_to_set(turn: LLMTurn, persona: Persona) -> LLMTurn:
 STAGE_TASK = {
     Stage.SELF_INTRO: "면접 시작 인사를 건네고, 타겟 기업/직무를 포함한 자기소개를 요청하라. 아직 채점 대상이 아니므로 score=-1.",
     Stage.TECH_Q1: "지원 직무의 핵심 역량을 검증하는 기술 질문 1개를 하라. 직전 답변(자기소개)은 채점하지 말고 score=-1.",
-    Stage.FOLLOWUP_1: "직전 기술 답변의 정확도/논리성을 0~100으로 채점하라. 점수가 60점 미만으로 낮거나 겉핥기식 대답이라면 '설명이 다소 원론적이네요'라며 실망감을 표하고 논리의 허점을 찌르는 압박 질문을 하라.점수가 높다면 해당 기술의 한계점이나 트레이드오프(Trade-off)를 묻는 심화 질문을 하라",
+    Stage.FOLLOWUP_1: (
+        "직전 기술 답변의 정확도/논리성을 0~100으로 채점하라."
+        "점수가 60점 미만으로 낮거나 겉핥기식 대답이라면, 그 실망감이 드러나는 반응을 보이며 논리의 허점을 찌르는 압박 질문을 하라. 반응 문장은 매번 새로 구성하고 정해진 문구를 반복하지 마라."
+        "점수가 높다면 해당 기술의 한계점이나 트레이드오프(Trade-off)를 묻는 심화 질문을 하라"
+    ),
     Stage.FOLLOWUP_2: "직전 답변을 STAR(상황/과제/행동/결과) 관점에서 재채점하라. 이전 질문을 계속 인용하며 늘어지는 것을 방지하기 위해, 화제를 완전히 전환하여 지원자의 이력서나 자기소개에 있는 **다른 기술 스택이나 새로운 상황(예: 대용량 트래픽, 에러 처리 등)**에 대한 새로운 기술 질문을 던져라.",
-    Stage.BEHAVIORAL: "직전 답변을 채점한 뒤, 협업/갈등해결 등 인성·조직적합성 질문으로 분위기를 자연스럽게 전환하라.",
-    Stage.CLOSING: "직전 답변을 채점한 뒤, '마지막으로 하고 싶은 말이나 궁금한 점'을 묻는 마무리 질문을 하고 정중히 마친다.",
+    Stage.BEHAVIORAL: (
+        "직전 답변은 score 필드로만 채점하고 대사에는 언급하지 마라. "
+        "기술적 세부사항을 다시 캐묻지 말고, 협업/갈등해결 등 인성, 조직적합성 질문 1개만 새로 제시하라."
+    ),
+    Stage.CLOSING: (
+        "직전 답변은 score 필드로만 채점하고 대사에는 언급하지 마라. "
+        " '마지막으로 하고 싶은 말이나 궁금한 점'을 묻는 마무리 질문만 하고 정중히 마친다."
+    ),
 }
 
 
-def _system_prompt(info: ExtractedInfo, resume: str) -> str:
+def _system_prompt(info: ExtractedInfo, resume: str, stage: Stage) -> str:
     """동적 페르소나 System Prompt. example.py 의 persona_prompt 가이드라인을 그대로 반영."""
     skills = ", ".join(info.mentioned_skills) or "미언급"
     strengths = ", ".join(info.key_strengths) or "미언급"
-    return (
+    base = (
         f"당신은 {info.company_name or '지원 기업'}의 {info.job_role or '해당 직무'} 채용 면접관이다.\n"
         "지원자 정보:\n"
         f"- 경력 수준: {info.experience_level}\n"
@@ -166,15 +176,43 @@ def _system_prompt(info: ExtractedInfo, resume: str) -> str:
         f"- {info.experience_level} 수준에 적합한 난이도로 조정한다.\n"
         "- 전문적이지만 위협적이지 않은 톤을 유지한다.\n"
         "- 질문은 한 번에 하나만, 2~3문장 이내로 짧게 한다.\n"
-        "**[엄격한 채점 및 리액션 기준]**\n"
-        "- 지원자가 기술적 원리 없이 대충 얼버무리거나 모호하게 대답하면 가차 없이 40점 이하를 부여하라.\n"
-        "- 대답이 부실한데도 '좋은 경험이네요', '잘 들었습니다' 등 무비판적으로 수용하고 넘어가는 태도는 절대 금지한다. \n"
-        "- 답변이 부실한 경우, 대사에 반드시 '방금 말씀하신 부분은 검증이 부족합니다만...', '그 정도 설명으로는 실무 적용이 어려워 보이는데요...' 같은 의구심(갸우뚱)을 텍스트로 표현해야 한다.\n"
+    )
+    TECH_STAGES = {Stage.TECH_Q1, Stage.FOLLOWUP_1, Stage.FOLLOWUP_2}
+    base += (
+        "**[채점 기준 - 아래 앵커를 기준으로 0-100 사이에서 판단]**\n"
+        "- 0점: 무응답, '모르겠습니다' 등 답변 자체가 없음\n"
+        "- 20점: 키워드만 나열, 원리, 설명 전혀 없음\n"
+        "- 40점: 키워드 + 단순 설명(결과만 서술, 근거 없음)\n"
+        "- 60점: 구체적 사례 제시(어떤 상황에서 어떻게 적용했는지 서술)\n"
+        "- 80점: 정량적 근거 포함(수치, 성능 지표, 비교 데이터 등)\n"
+        "- 100점: STAR(상황/과제/행동/결과) 요소를 모두 갖춘 완결된 설명\n"
+        "구간 사이 점수는 보간하되, 특별한 이유 없이 40~60점에 점수를 몰아주지 마라.\n" 
+    )
+    if stage in TECH_STAGES:
+        base += (
+            "**[엄격한 채점 및 리액션 기준]**\n"
+            "- 지원자가 기술적 원리 없이 대충 얼버무리거나 모호하게 대답하면 가차 없이 40점 이하를 부여하라.\n"
+            "- 대답이 부실한데도 '좋은 경험이네요', '잘 들었습니다' 등 무비판적으로 수용하고 넘어가는 태도는 절대 금지한다. \n"
+            "- 답변이 부실한 경우, 답변에서 구체적으로 어떤 근거, 수치, 구현 디테일이 빠졌는지 콕 집어 언급하며 회의적인 어조로 반문한다.\n"
+            "- 문장 구조와 어휘는 매 턴 새롭게 구성하고, 정해진 문구를 절대 반복하지 않는다.\n"
+            "- 의구심을 들어내는 방식을 매 턴 다르게 선택하다: "
+            "(1) 빠진 근거를 짚는 반문,"
+            "(2) 실무 적용 가능성에 의문 제기, "
+            "(3) 논리적 비약 지적, "
+            "(4) 더 구체적인 사례 요구. 위 중 매번 다른 접근을 쓰고, 문장을 새로 적성한다. \n")
+    else:
+        base += (
+            "**[이 단계의 리액션 기준]**\n"
+            "- 직전 답변은 score 필드로만 채점하고, 대사에서는 기술적 세부사항(구현 방식, 성능, 코드 등)을 다시 언급하거나 추가로 캐묻지 않는다. \n"
+            "- 대사는 이번 단계 고유 주제에만 집중한 새로운 질문으로 구성한다. \n"
+        )
+    base += (
         "규칙:\n"
         "1) 모든 대사는 자연스러운 한국어 존댓말.\n"
         "2) 대사는 음성합성(TTS)으로 출력되므로 마크다운/이모지/괄호설명 없이 말로만 작성.\n"
         "3) 반드시 지정된 JSON 스키마로만 응답한다. 그 외 텍스트 금지.\n"
     )
+    return base
 
 
 def _turn_instruction(stage: Stage, persona: Persona, history: str, user_answer: str) -> str:
@@ -203,15 +241,26 @@ def _turn_instruction(stage: Stage, persona: Persona, history: str, user_answer:
         #"expression_id/gesture_id는 반드시 위 허용값 중에서만 고른다."
     )
 
+MIN_ANSWER_CHARS = 15 #공백 제외 글자 수 기준
+
+def _apply_length_guard(score: int, user_answer:str) -> int:
+    """지나치게 짧은 답변은 점수 상한을 코드 레벨에서 강제로 제한한다."""
+    if score <= 0:
+        return score
+    char_count = len(user_answer.strip().replace(" ", ""))
+    if char_count < MIN_ANSWER_CHARS:
+        return min(score, 30)
+    return score
 
 async def generate_turn(
     *, stage: Stage, persona: Persona, info: ExtractedInfo, resume: str,
     history: str, user_answer: str,
 ) -> LLMTurn:
     """한 턴의 면접관 발화를 생성한다. JSON 파싱 실패 시 1회 재시도."""
-    system = _system_prompt(info, resume)
+    system = _system_prompt(info, resume, stage)
     user = _turn_instruction(stage, persona, history, user_answer)
     for attempt in range(2):
+        data = None
         try:
             data = await _ask_json(system, user)
 
@@ -225,6 +274,7 @@ async def generate_turn(
                     data["score"] = -1
 
             turn = LLMTurn(**data)
+            turn.score = _apply_length_guard(turn.score, user_answer)
             return _clamp_to_set(turn, persona)
         except Exception as e:
             print(f"[에러 발생] LLM 응답 파싱 실패: {e}, 받은 데이터: {data}")
