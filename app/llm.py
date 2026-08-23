@@ -267,13 +267,10 @@ def _truncation_premise(reason: str) -> str:
 async def generate_turn(
     *, stage: Stage, persona: Persona, info: ExtractedInfo, resume: str,
     history: str, user_answer: str, extra_instruction: str = "",
-    truncated_reason: str | None = None,
 ) -> LLMTurn:
     """한 턴의 면접관 발화를 생성한다. JSON 파싱 실패 시 1회 재시도."""
     system = _system_prompt(info, resume, stage)
-    if truncated_reason:
-        system += _truncation_premise(truncated_reason)
-    user = _turn_instruction(stage, persona, history, user_answer)
+    user = _turn_instruction(stage, persona, history, user_answer, extra_instruction)
     for attempt in range(2):
         data = {}
         try:
