@@ -177,14 +177,15 @@ def _system_prompt(info: ExtractedInfo, resume: str) -> str:
     )
 
 
-def _turn_instruction(stage: Stage, persona: Persona, history: str, user_answer: str) -> str:
+def _turn_instruction(stage: Stage, persona: Persona, history: str, user_answer: str, extra_instruction: str = "") -> str:
     sets = PERSONA_BEHAVIOR_SET[persona]
     allowed_expr = ", ".join(f"{e.value}={e.name}" for e in sets["expressions"])
     allowed_gest = ", ".join(f"{g.value}={g.name}" for g in sets["gestures"])
     return (
         f"[현재 단계] {stage.value}\n"
         f"[이번 턴 과제] {STAGE_TASK[stage]}\n"
-        f"[현재 페르소나] {persona.value} "
+        + (f"{extra_instruction}\n" if extra_instruction else "")
+        + f"[현재 페르소나] {persona.value} "
         "(POSITIVE=안정감/미소, NEUTRAL=경청, NEGATIVE=압박/냉정)\n"
         f"[직전 지원자 답변] {user_answer or '(아직 없음 - 면접관이 먼저 말함)'}\n"
         f"[지금까지의 대화 요약]\n{history or '(없음)'}\n\n"
@@ -206,12 +207,13 @@ def _turn_instruction(stage: Stage, persona: Persona, history: str, user_answer:
 
 async def generate_turn(
     *, stage: Stage, persona: Persona, info: ExtractedInfo, resume: str,
-    history: str, user_answer: str,
+    history: str, user_answer: str, extra_instruction: str = "",
 ) -> LLMTurn:
     """한 턴의 면접관 발화를 생성한다. JSON 파싱 실패 시 1회 재시도."""
     system = _system_prompt(info, resume)
     user = _turn_instruction(stage, persona, history, user_answer)
     for attempt in range(2):
+        data = {}
         try:
             data = await _ask_json(system, user)
 
