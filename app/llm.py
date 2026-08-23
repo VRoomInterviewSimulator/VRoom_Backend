@@ -253,12 +253,26 @@ def _apply_length_guard(score: int, user_answer:str) -> int:
         return min(score, 30)
     return score
 
+def _truncation_premise(reason: str) -> str:
+    """설계서 6.2/6.3: CUTOFF 개입 직후 다음 질문 생성 시 주입하는 전제."""
+    label = {
+        "LONG_ANSWER": "답변이 지나치게 길어져 시스템이 시간 초과로 중단시켰다",
+        "LONG_SILENCE": "질문 후 지원자가 오래 응답하지 않아 시스템이 중단시켰다",
+    }.get(reason, "시스템이 답변을 중단시켰다")
+    return (
+        f"\n**[전제]** 직전 답변은 지원자가 스스로 마친 것이 아니라 {label}. "
+        "이 사실을 지원자 탓으로 언급하거나 캐묻지 말고 자연스럽게 다음 질문으로 넘어간다.\n"
+    )
+
 async def generate_turn(
     *, stage: Stage, persona: Persona, info: ExtractedInfo, resume: str,
     history: str, user_answer: str, extra_instruction: str = "",
+    truncated_reason: str | None = None,
 ) -> LLMTurn:
     """한 턴의 면접관 발화를 생성한다. JSON 파싱 실패 시 1회 재시도."""
     system = _system_prompt(info, resume, stage)
+    if truncated_reason:
+        system += _truncation_premise(truncated_reason)
     user = _turn_instruction(stage, persona, history, user_answer)
     for attempt in range(2):
         data = {}
@@ -287,6 +301,123 @@ async def generate_turn(
                     gesture_id=GestureID.LISTENING_NOD.value,
                 )
     raise RuntimeError("unreachable")
+
+# ---------------------------------------------------------------------------
+# (2.5) 개입(바지인) - 주제 이탈 판정 
+# ---------------------------------------------------------------------------
+_OFF_TOPIC_TOOL = {
+    "type": "function",
+    "function" : {
+        "name" : "judge_off_topic",
+        "description": "지원자의 답변이 질문 주제에서 벗어났는지 판정합니다",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "is_off_topic": {
+                    "type": "boolean", 
+                    "description": "명백히 주제에서 벗어났으면 true, 애매하거나 사례 도입/설명 중일 가능성이 있으면 false",
+                    },
+            },
+            "required": ["is_off_topic"]
+        },
+    },
+}
+
+async def judge_off_topic(question:str, partial_answer: str) -> bool:
+    """직전 질문과 지금까지의 부분 전사만으로 주제 이탈 여부를 판정한다.
+    설계서 3.5: 보수적으로 판정한다 - 애매하면 False(이탈 아님)."""
+    system = (
+        "당신은 면접 답변이 질문 주제에서 벗어났는지 판정하는 판정기다.\n"
+        "반드시 보수적으로 판정하라. 애매하면 무조건 이탈 아님(false)으로 판정한다.\n"
+        "답변 초반은 사례를 도입하는 중일 수 있으므로, 겉보기에 다른 화제 같아도 질문과 연결될 가능성이 있으면 이탈로 보지 않는다.\n"
+        "예시:\n"
+        "- 이탈 아님: 질문 '협업 경험'에 답변이 '대학교 때 축구 동아리에서...'로 시작 -> 사례 도입일 수 있음.\n"
+        "- 이탈 맞음: 질문 '협업 경험'에 답변이 '어제 축구 경기 보셨어요? 후반전에...' -> 질문과 무관한 화제로 완전히 벗어남.\n"
+        "판정 이유는 생성하지 말고 boolean 값만 반환한다."
+    )
+    user = f"[질문] {question}\n[지금까지의 답변] {partial_answer}"
+    try:
+        resp = await _get_client().chat.completions.create(
+            model=_model,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            tools=[_OFF_TOPIC_TOOL],
+            tool_choice={"type": "function", "function": {"name": "judge_off_topic"}},
+        )
+        args = json.loads(resp.choices[0].message.tool_calls[0].function.arguments)
+        return bool(args.get("is_off_topic", False))
+    except Exception as e:
+        print(f"[에러 발생] 주제 이탈 판정 실패: {e}")
+        return False
+
+INTERVENTION_EXPRESSION_ID = 5
+INTERVENTION_GESTURE_ID = 8
+
+def _intervention_system_prompt(info: ExtractedInfo) -> str:
+    skills = ", ".join(info.mentioned_skills) or "미언급"
+    return (
+        f"당신은 {info.company_name or '지원 기업'}의 {info.job_role or '해당 직무'} 채용 면접관이다.\n"
+        f"지원자 보유 기술: {skills}\n\n"
+        "지금 당신은 부정적인 태도 상태이며, 지원자의 답변 도중 말을 끊고 개입하려 한다.\n"
+        "규칙:\n"
+        "1) 대사는 원본 질문보다 짧게, 2문장 이내로 작성한다.\n"
+        "2) 지금까지의 답변을 인용하되, 부분 전사는 정확도가 낮을 수 있으므로 핵심 명사 한두 개만 짧게 인용한다. 문장 전체를 그대로 옮기지 않는다.\n"
+        "3) 단호한 어조를 쓰되 모욕적이지 않게 한다.\n"
+        "4) 자연스러운 한국어 존댓말, TTS로 출력되므로 마크다운/이모지/괄호설명 없이 말로만.\n"
+        "5) 반드시 지정된 JSON 스키마로만 응답한다.\n"
+    )
+
+def _intervention_instruction(bargein_type: str, reason: str, question: str, partial_answer: str) -> str:
+    if bargein_type == "REDIRECT":
+        shape = (
+            "[대사 구성] [끊는 신호] + [지금까지 답변의 어떤 부분이 주제를 벗어났는지 짧게 지적] + [원본 질문을 그대로 다시 제시]\n"
+            f"[원본 질문] {question}\n"
+        ) 
+    else:
+        shape = (
+            "[대사 구성] [끊는 신호] + [간결한 마무리 지적] + [다음으로 넘어간다는 짧은 전환 문구]\n"
+            "다음 질문 본문은 별도로 이어붙으므로 여기서는 전환 문구까지만 작성한다.\n"
+        )
+    return (
+        f"[개입 유형] {bargein_type} (사유: {reason})\n"
+        f"[지금까지 지원자가 한 말] {partial_answer}\n"
+        f"{shape}\n"
+        "반드시 아래 순수 JSON으로만 응답하라:\n"
+        "{\n"
+        '  "dialogue": "면접관 개입 대사(한국어)",\n'
+        f'  "expression_id": {INTERVENTION_EXPRESSION_ID},\n'
+        f'  "gesture_id": {INTERVENTION_GESTURE_ID}\n'
+        "}\n"
+        "score, score_reason 필드는 포함하지 마라. 이 대사는 채점 대상이 아니다."
+    )
+
+async def generate_intervention(
+        *, stage: Stage, persona: Persona, bargein_type: str, reason: str, question: str, partial_answer: str, info: ExtractedInfo
+) -> LLMTurn:
+    """면접관이 답변 도중 끼어들 때의 개입 대사를 생성한다. score는 항상 -1로 고정."""
+    system = _intervention_system_prompt(info)
+    user = _intervention_instruction(bargein_type, reason, question, partial_answer)
+    try:
+        data = await _ask_json(system, user)
+        data["score"] = -1
+        data.setdefault("score_reason", "")
+        turn = LLMTurn(**data)
+        return _clamp_to_set(turn, persona)
+    except Exception as e:
+        print(f"[에러 발생] genereate_intervention 실패: {e}")
+        fallback = (
+            "잠시만요, 질문으로 다시 돌아가죠." if bargein_type == "REDIRECT" else "네, 거기까지 듣겠습니다. 다음 질문으로 넘어가죠."
+        )
+        return LLMTurn(
+            dialogue=fallback, 
+            score=-1,
+            expression_id=ExpressionID.NEUTRAL.value,
+            gesture_id=GestureID.LISTENING_NOD.value
+        )
+
 
 
 # ---------------------------------------------------------------------------
