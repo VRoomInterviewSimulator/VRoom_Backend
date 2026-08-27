@@ -34,7 +34,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import bargein, llm, tts_client
+from . import bargein, llm, session_log, tts_client
 from .config import BargeInConfig, settings
 from .domain import (
     AnswerRequest,
@@ -348,6 +348,109 @@ async def handle_bargein_signal(sid: str, session: InterviewSession,
     asyncio.create_task(_cutoff_watchdog(sid, session))
 
 
+async def handle_partial_transcript(sid: str, session: InterviewSession,
+                                    cumulative: str) -> None:
+    """Type A 진입점. 발화 도중의 누적 전사를 받아 주제 이탈 여부를 판정한다.
+ 
+    Type B(handle_bargein_signal)와 달리 Unity 가 아니라 STT 워커가 보낸다.
+    Unity 는 길이/침묵만 재고, 의미 판정은 백엔드가 한다.
+ 
+    호출 빈도가 높으므로(발화 중 1~2초 간격) 거부 로그는 게이트가 바뀔 때만
+    찍는다. 매번 찍으면 콘솔이 부분 전사로 뒤덮여 다른 로그를 못 본다.
+    """
+    if not cumulative:
+        return
+ 
+    # 이미 개입해 재답변을 기다리는 중이면 다시 판정하지 않는다.
+    if session.awaiting_reanswer:
+        return
+ 
+    decision = await bargein.evaluate_partial(session, cumulative)
+ 
+    if not decision.granted:
+        last = getattr(session, "_last_partial_deny", None)
+        if decision.denied_by != last:
+            session._last_partial_deny = decision.denied_by
+            print(f"[개입] REDIRECT 거부 ({decision.denied_by}) "
+                  f"stage={session.stage.value} persona={session.persona.value} "
+                  f"chars={len(cumulative.replace(' ', ''))}")
+        return
+ 
+    session._last_partial_deny = None
+    session.commit_bargein(decision)
+ 
+    # (1) 컷인 반사 명령 — 대사 생성을 기다리지 않고 먼저 보낸다.
+    #     Unity 의 상태 전이(UserAnswering -> BargeInPending)와 발화 강제 확정,
+    #     표정 변경이 전부 이 메시지에 달려 있다.
+    await hub.send_json(sid, bargein.build_cutin_message(session, decision))
+ 
+    # (2) 개입 대사는 별도 태스크로. 여기서 await 하면 수신 루프가 막힌다.
+    #     Type B 와 달리 워치독은 걸지 않는다. Type A 는 단계를 전진시키지
+    #     않으므로 전사가 늦게 와도 세션이 멈추지 않는다.
+    asyncio.create_task(_speak_redirect(sid, session, decision))
+ 
+ 
+async def _speak_redirect(sid: str, session: InterviewSession, decision) -> None:
+    """Type A 개입 대사를 생성해 발송한다.
+ 
+    Type B 는 템플릿(_INTERVENTION_TEMPLATES)으로 처리하지만, Type A 는
+    "무엇에서 벗어났는지"를 인용해야 하므로 LLM(L2)이 필요하다.
+    """
+    loop = asyncio.get_event_loop()
+    t0 = loop.time()
+    question = session.current_question_text
+    try:
+        turn = await llm.generate_intervention(
+            stage=session.stage,
+            persona=session.persona,
+            bargein_type=decision.bargein_type,
+            reason=decision.reason,
+            question=question,
+            partial_answer=decision.meta.get("partial_text", ""),
+            info=session.info,
+        )
+ 
+        # 개입 자체는 채점 이벤트가 아니고, 비언어는 게이트 상수로 고정한다.
+        turn.score = -1
+        turn.expression_id = ExpressionID.FIRM_STOP.value
+        turn.gesture_id = GestureID.ARMS_CROSSED.value
+ 
+        # update_question=False 가 중요하다. 여기서 덮어쓰면 잘린 답변 채점과
+        # 재답변 채점이 원래 질문이 아니라 개입 대사를 기준으로 돌아간다.
+        session._record("interviewer", turn.dialogue, update_question=False)
+        packet = session._to_packet(turn, is_final=False,
+                                    bargein_type=decision.bargein_type)
+ 
+        def _mark_first_chunk():
+            ms = int((loop.time() - t0) * 1000)
+            session.note_speech_latency(ms)
+            print(f"[개입] REDIRECT 첫 발성까지 {ms}ms")
+ 
+        await speak(sid, packet, on_first_chunk=_mark_first_chunk)
+ 
+        full_ms = int((loop.time() - t0) * 1000)
+        if session.bargein_log:
+            session.bargein_log[-1]["latency_full_ms"] = full_ms
+        print(f"[개입] REDIRECT 대사 완료 (총 {full_ms}ms) \"{turn.dialogue}\"")
+ 
+    except Exception as e:
+        # 대사 생성이 실패해도 Unity 는 이미 컷인을 받아 개입 상태로 전이했다.
+        # 아무 말도 안 하면 면접관이 노려보기만 하므로 폴백 대사라도 내보낸다.
+        print(f"[개입] REDIRECT 대사 실패: {e}")
+        try:
+            fallback = LLMTurn(
+                dialogue="잠시만요. 제가 여쭌 질문으로 다시 돌아가 주시겠습니까?",
+                expression_id=ExpressionID.FIRM_STOP.value,
+                gesture_id=GestureID.ARMS_CROSSED.value,
+                score=-1,
+            )
+            session._record("interviewer", fallback.dialogue, update_question=False)
+            await speak(sid, session._to_packet(
+                fallback, is_final=False, bargein_type=decision.bargein_type))
+        except Exception as e2:
+            print(f"[개입] REDIRECT 폴백도 실패: {e2}")
+ 
+
 async def _speak_intervention(sid: str, session: InterviewSession, decision):
     """발화 1 — 개입 대사를 템플릿에서 골라 즉시 발송한다.
 
@@ -371,7 +474,7 @@ async def _speak_intervention(sid: str, session: InterviewSession, decision):
             score=-1,                                  # 개입 자체는 채점 이벤트가 아니다
         )
 
-        session._record("interviewer", turn.dialogue)
+        session._record("interviewer", turn.dialogue, update_question=False)
         packet = session._to_packet(turn, is_final=False,
                                     bargein_type=decision.bargein_type)
 
@@ -491,6 +594,11 @@ async def ws_control(ws: WebSocket):
         traceback.print_exc()
     finally:
         if sid:
+            # 결과 화면까지 못 가고 끊긴 세션도 원자료는 남긴다.
+            # 이미 정상 저장됐으면 log_written 플래그로 무시된다.
+            s = hub.sessions.get(sid)
+            if s is not None:
+                session_log.dump(s, None, exit_reason="disconnect")
             await hub.unregister(sid)
 
 
@@ -508,10 +616,19 @@ async def _on_init(ws: WebSocket, msg: dict) -> str:
             condition=msg.get("condition", "C"),
         )
     else:
-        # 프리웜 세션에도 실험 조건을 반영한다 (prepare 시점엔 조건을 모른다).
         s = hub.sessions.get(sid)
         if s is not None:
+            # 프리웜 세션은 prepare 시점에 만들어져 조건을 모른다. 여기서 채운다.
             s.condition = msg.get("condition", "C")
+            # prepare 시점부터 셋업 화면 대기 시간까지 포함되므로,
+            # 개입 시각(triggered_at)의 기준을 '면접 시작'으로 맞춘다.
+            s.session_started_at = time.time()
+
+    # 실험 유효성 헤더. 두 경로 모두에서 찍히도록 if/else 밖에 둔다.
+    _s = hub.sessions.get(sid)
+    print(f"[{sid}] 세션 시작 — condition={_s.condition if _s else '?'}, "
+          f"prewarmed={prepared is not None}, "
+          f"force_negative={settings.bargein_force_negative}")
 
     await hub.register(sid, ws)
 
@@ -531,9 +648,13 @@ def _on_utterance_started(sid: str | None):
 
 
 def _on_utterance_end(sid: str | None, msg: dict):
-    """(옵션) Unity 가 STT 를 거치지 않고 음성 피쳐만 보낼 때 집계한다."""
-    if sid and sid in hub.sessions:
-        hub.sessions[sid]._collect_features(msg.get("features", {}))
+    """(사용 안 함) Unity 는 음성 피쳐를 STT 워커 경유로 보낸다.
+
+    여기서 _collect_features 를 부르면 turn_stages 없이 리스트만 늘어나
+    인덱스 정합이 깨진다. 레거시 호환이 필요해지면 turn_stages.append 를
+    함께 넣을 것.
+    """
+    return
 
 
 async def _on_bargein_signal(sid: str | None, msg: dict):
@@ -560,15 +681,19 @@ async def _on_request_feedback(sid: str | None):
     if not (sid and sid in hub.sessions):
         return
 
+    session = hub.sessions[sid]
+    report = None
     try:
-        report = await hub.sessions[sid].build_feedback()
+        report = await session.build_feedback()
         await hub.send_json(sid, report.model_dump())
         print(f"[ws_control] feedback_report 전송 완료 (sid={sid})")
     except Exception as e:
         print(f"[ws_control] build_feedback 에러: {e}")
         import traceback
         traceback.print_exc()
-
+    finally:
+        # 리포트 생성에 실패해도 원자료는 남긴다. 실험 데이터가 더 중요하다.
+        session_log.dump(session, report, exit_reason="normal")
 
 # ===========================================================================
 # 5. 엔드포인트 — STT 워커 채널
@@ -588,6 +713,19 @@ async def ws_tts(ws: WebSocket):
 
         while True:
             msg = json.loads(await ws.receive_text())
+            mtype = msg.get("type", "")
+
+            # ── Type A 부분 전사 ───────────────────────────────────────
+            # STT 워커(V1)가 발화 도중 누적 전사를 주기적으로 보낸다.
+            # 이 분기가 없으면 아래 `if not user_text` 에서 통째로 버려진다.
+            if mtype == "partial_transcript":
+                p_sid = msg.get("session_id") or sid or hub.last_active or "default"
+                p_session = hub.sessions.get(p_sid)
+                if p_session is not None:
+                    await handle_partial_transcript(
+                        p_sid, p_session, msg.get("cumulative", ""))
+                continue
+
             user_text = msg.get("text", "")
             if not user_text:
                 continue

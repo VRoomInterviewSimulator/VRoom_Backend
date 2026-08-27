@@ -95,14 +95,21 @@ class InterviewSession:
         # ── 실험 로그 ──────────────────────────────────────────────
         self.session_started_at: float = time.time() # 세션 시작 시각 (상대 시각 계산 기준)
         self.bargein_log: list[dict] = []            # 개입 이벤트별 상세 기록
+        self.turn_features: list[dict] = []          # turn_stages 와 인덱스가 1:1 로 대응되는 로그
+        self.log_written: bool = False           # 세션 로그를 이미 파일로 떨어뜨렸는가
 
     # =======================================================================
     # 2. 내부 유틸 — 기록 / 단계 / 패킷 변환
     # =======================================================================
-    def _record(self, role: str, text: str):
-        """발화 한 건을 기록한다. 면접관 발화면 '직전 질문'으로도 갱신한다."""
+    def _record(self, role: str, text: str, update_question: bool = True):
+        """발화 한 건을 기록한다. 면접관 발화면 '직전 질문'으로도 갱신한다.
+
+        update_question=False: 개입 대사와 마무리 멘트는 질문이 아니다.
+        여기서 덮어쓰면 이탈 판정(judge_off_topic)과 답변 채점의 기준 질문이
+        개입 대사로 바뀌어, 실제 질문과 무관하게 판정된다.
+        """
         self.turns.append({"role": role, "stage": self.stage.value, "text": text})
-        if role == "interviewer" and text:
+        if role == "interviewer" and text and update_question:
             self.current_question_text = text
 
     def _history_text(self) -> str:
@@ -273,7 +280,7 @@ class InterviewSession:
             expression_id=ExpressionID.WARM_SMILE.value,
             gesture_id=GestureID.DEEP_NOD.value, score=-1, is_final=True,
         )
-        self._record("interviewer", closing.dialogue)
+        self._record("interviewer", closing.dialogue, update_question=False)
         return closing
 
     def _apply_score(self, turn: LLMTurn) -> LLMTurn:
@@ -429,21 +436,44 @@ class InterviewSession:
     # 5. 피쳐 수집
     # =======================================================================
     def _collect_features(self, features: dict, text: str = ""):
-        """Unity/STT 가 보낸 턴별 음성 피쳐를 각 리스트에 한 칸씩 쌓는다."""
-        if not features:
-            return
+        """Unity/STT 가 보낸 턴별 음성 피쳐를 각 리스트에 한 칸씩 쌓는다.
 
-        st = features.get("speakingTime")
-        if isinstance(st, (int, float)) and st > 0:
-            self.speaking_times.append(float(st))
-            self.cps_list.append(len(text) / float(st))
+        계약: 이 함수가 한 번 호출되면 모든 리스트가 정확히 한 칸씩 늘어난다.
+        예전에는 speakingTime<=0 이나 features 부재 시 일부 리스트만 건너뛰어,
+        그 이후 턴부터 turn_stages 와 인덱스가 어긋났다. 그러면 반응 속도가
+        다른 단계의 기대값으로 채점된다.
+        무효한 턴은 여기서 0 으로 채우고 _score_voice 가 걸러낸다.
+        """
+        st = features.get("speakingTime") if features else None
+        valid_st = isinstance(st, (int, float)) and st > 0
 
-        self.meaningful_pauses.append(
-            int(features.get("meaningfulPauseCount", features.get("pauseCount", 0))))
-        self.volume_variances.append(float(features.get("volumeVariance", 0.0)))
-        self.low_volume_ratios.append(float(features.get("lowVolumeRatio", 0.0)))
-        self.response_times.append(float(features.get("responseTime", 0.0)))
-        self.average_volumes.append(float(features.get("averageVolume", 0.1)))
+        # 로그 전용 행
+        self.turn_features.append({
+            "stage": self.stage.value,
+            "text_len": len(text),
+            "speakingTime": round(float(st), 3) if valid_st else None,
+            "cps": round(len(text) / float(st), 2) if valid_st else None,
+            "meaningfulPauseCount": int(features.get(
+                "meaningfulPauseCount", features.get("pauseCount", 0))) if features else None,
+            "volumeVariance": features.get("volumeVariance") if features else None,
+            "lowVolumeRatio": features.get("lowVolumeRatio") if features else None,
+            "responseTime": features.get("responseTime") if features else None,
+            "averageVolume": features.get("averageVolume") if features else None,
+        })
+
+        # 채점용 리스트 — 조건 없이 전부 한 칸씩. 무효 턴은 0(또는 기준값)으로 채운다.
+        self.speaking_times.append(float(st) if valid_st else 0.0)
+        self.cps_list.append(len(text) / float(st) if valid_st else 0.0)
+        self.meaningful_pauses.append(int(features.get(
+            "meaningfulPauseCount", features.get("pauseCount", 0))) if features else 0)
+        self.volume_variances.append(
+            float(features.get("volumeVariance", 0.0)) if features else 0.0)
+        self.low_volume_ratios.append(
+            float(features.get("lowVolumeRatio", 0.0)) if features else 0.0)
+        self.response_times.append(
+            float(features.get("responseTime", 0.0)) if features else 0.0)
+        self.average_volumes.append(
+            float(features.get("averageVolume", 0.1)) if features else 0.1)
 
     def collect_vision_features(self, features: dict):
         """Vision 워커가 턴 종료 시 POST 한 웹캠 피쳐를 보관한다."""
@@ -455,8 +485,9 @@ class InterviewSession:
     # =======================================================================
     async def build_feedback(self) -> FeedbackReport:
         """면접 종료 시 10항목 점수 + LLM 총평을 묶어 결과 리포트를 만든다."""
-        turn_count = len(self.speaking_times)
-        avg_speak = (sum(self.speaking_times) / turn_count) if turn_count > 0 else 0.0
+        valid_times = [t for t in self.speaking_times if t > 0]
+        turn_count = len(valid_times)
+        avg_speak = (sum(valid_times) / turn_count) if turn_count > 0 else 0.0
         total_pauses = sum(self.meaningful_pauses)
 
         # (1) LLM 총평 — 강점/개선점/총평 + filler_score, density_score
@@ -472,7 +503,7 @@ class InterviewSession:
         accuracy10 = round((sum(scored) / len(scored)) / 10) if scored else 0
 
         # (3) 음성 4항목 — 턴별 점수의 평균
-        vol_score, speed_score, time_score_avg, rt_score = self._score_voice(turn_count)
+        vol_score, speed_score, time_score_avg, rt_score = self._score_voice()
 
         # (4) 답변 길이 = 물리적 시간 점수와 LLM 내용 밀도 점수의 50:50
         density_score = data.get("density_score", 5)
@@ -517,24 +548,28 @@ class InterviewSession:
             total_pauses=total_pauses,
         )
 
-    def _score_voice(self, turn_count: int) -> tuple[int, int, int, int]:
+    def _score_voice(self) -> tuple[int, int, int, int]:
         """음성 4항목을 턴별로 채점해 평균을 낸다.
 
         반환: (목소리 크기, 발화 속도, 답변 길이-시간분, 반응 속도)
         답변 길이는 여기서 '물리적 시간 점수'만 내고, LLM 밀도 점수와의 합산은 호출자가 한다.
+
+        모든 리스트가 turn_stages 와 인덱스 정합을 이루므로, 발화가 실제로
+        있었던 턴(speakingTime>0)만 골라 그 인덱스로 전부를 조회한다.
         """
         from .config import ScoringConfig as S
 
-        if turn_count <= 0:
-            return (10, 10, 10, 10)   # 턴이 없으면 감점할 근거가 없으므로 만점
+        idxs = [i for i, st in enumerate(self.speaking_times) if st > 0]
+        if not idxs:
+            return (10, 10, 10, 10)   # 유효한 턴이 없으면 감점할 근거가 없으므로 만점
 
         total_vol = total_speed = total_length = total_rt = 0
 
-        for i in range(turn_count):
+        for i in idxs:
             # ── 1. 목소리 크기 ──────────────────────────────────────
-            vol = self.average_volumes[i] if i < len(self.average_volumes) else S.VOICE_VOLUME_MEAN
-            var = self.volume_variances[i] if i < len(self.volume_variances) else 0.0
-            low = self.low_volume_ratios[i] if i < len(self.low_volume_ratios) else 0.0
+            vol = self.average_volumes[i]
+            var = self.volume_variances[i]
+            low = self.low_volume_ratios[i]
 
             s_vol = 10 - int(abs(vol - S.VOICE_VOLUME_MEAN) / S.VOICE_VOLUME_TOLERANCE)
             if var > S.VOLUME_VARIANCE_THRESHOLD:
@@ -544,8 +579,8 @@ class InterviewSession:
             total_vol += max(0, min(10, s_vol))
 
             # ── 2. 발화 속도 ────────────────────────────────────────
-            cps = self.cps_list[i] if i < len(self.cps_list) else S.VOICE_SPEED_MEAN
-            pauses = self.meaningful_pauses[i] if i < len(self.meaningful_pauses) else 0
+            cps = self.cps_list[i]
+            pauses = self.meaningful_pauses[i]
 
             s_speed = 10 - int(abs(cps - S.VOICE_SPEED_MEAN) / S.VOICE_SPEED_TOLERANCE)
             s_speed -= int(max(0, pauses - S.PAUSE_ALLOWANCE))
@@ -562,7 +597,7 @@ class InterviewSession:
             total_length += max(0, min(10, s_len))
 
             # ── 4. 반응 속도 (단계별 기대값이 다르다) ───────────────
-            rt = self.response_times[i] if i < len(self.response_times) else 0.0
+            rt = self.response_times[i]
             stage = self.turn_stages[i] if i < len(self.turn_stages) else "UNKNOWN"
             target_rt = (S.RESPONSE_TIME_INTRO_MEAN if stage == "SELF_INTRO"
                          else S.RESPONSE_TIME_FOLLOWUP_MEAN)
@@ -570,10 +605,9 @@ class InterviewSession:
             s_rt = 10 - int(abs(rt - target_rt) / S.RESPONSE_TIME_TOLERANCE)
             total_rt += max(0, min(10, s_rt))
 
-        return (round(total_vol / turn_count),
-                round(total_speed / turn_count),
-                round(total_length / turn_count),
-                round(total_rt / turn_count))
+        n = len(idxs)
+        return (round(total_vol / n), round(total_speed / n),
+                round(total_length / n), round(total_rt / n))
 
     def _score_vision(self) -> tuple[bool, int, int, int, int]:
         """웹캠 4항목을 턴별로 채점해 평균을 낸다.
