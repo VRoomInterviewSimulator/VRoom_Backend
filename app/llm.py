@@ -416,6 +416,72 @@ async def generate_intervention(
         )
 
 
+# ---------------------------------------------------------------------------
+# (2.6) 개입(바지인) - 단일 답변 채점
+# ---------------------------------------------------------------------------
+
+_SCORE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "score_answer",
+        "description": "지원자의 답변 하나를 0~100점으로 채점합니다",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "0~100 사이의 정수 점수",
+                },
+                "score_reason": {
+                    "type": "string",
+                    "description": "채점 근거 한 문장",
+                },
+            },
+            "required": ["score", "score_reason"],
+        },
+    },
+}
+
+def _score_answer_system_prompt() -> str:
+    """_system_prompt의 채점 앵커와 동일하게 유지할 것 - 나중에 기준표를 바꾸면 두 곳 다 수정."""
+    return (
+        "당신은 면접 답변을 채점하는 채점관이다. 대사나 질문은 만들지 않고 채점만 한다.\n\n"
+        "**[채점 기준 - 아래 앵커를 기준으로 0-100 사이에서 판단]**\n"
+        "- 0점: 무응답, '모르겠습니다' 등 답변 자체가 없음\n"
+        "- 20점: 키워드만 나열, 원리, 설명 전혀 없음.\n"
+        "- 40점: 키워드 + 단순 설명(결과만 서술, 근거 없음)\n"
+        "- 60점: 구체적 사례 제시(어떤 상황에서 어떻게 적용했는지 서술)\n"
+        "- 80점: 정량적 근거 포함(수치, 성능 지표, 비교 데이터 등)\n"
+        "- 100점: STAR(상황/과제/행동/결과) 요소를 모두 갖춘 완결된 설명\n"
+        "구간 사이 점수는 보간하되, 특별한 이유 없이 40~60점에 점수를 몰아주지 마라.\n"
+        "답변이 중간에 끊겼거나 미완성 상태여도, 그 상테 그대로의 내용만 근거로 채점한다.\n"
+        "완성됐다면 어떤 점수였을지 가정해서 보정하지 않는다.\n"
+    )
+
+async def score_answer(*, question: str, answer: str) -> int:
+    """답변 하나만 0~100으로 채점한다. 대사는 만들지 않는다.
+    미완성 텍스트도 그대로 채점하고 고정 점수로 대체하지 않는다."""
+    system = _score_answer_system_prompt()
+    user = f"[질문] {question}\n[지원자 답변] {answer}"
+    try:
+        resp = await _get_client().chat.completions.create(
+            model=_model,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            tools=[_SCORE_TOOL],
+            tool_choice={"type": "function", "function": {"name": "score_answer"}},
+        )
+        args = json.loads(resp.choices[0].message.tool_calls[0].function.arguments)
+        score = int(args.get("score", -1))
+        return max(0, min(100, score))
+    except Exception as e:
+        print(f"[에러 발생] score_answer 실패: {e}")
+        return -1
 
 # ---------------------------------------------------------------------------
 # (3) 종료 피드백
