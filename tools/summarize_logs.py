@@ -191,7 +191,6 @@ def print_by_condition(sessions: list[dict]) -> None:
         print(f"  개입 유형: {types}")
         print(f"  개입 사유: {reasons}")
 
-
 # ---------------------------------------------------------------------------
 # 3. 위상별 웹캠 지표 — 핵심 표
 # ---------------------------------------------------------------------------
@@ -244,6 +243,40 @@ def print_by_phase(sessions: list[dict]) -> None:
     print("  * NORMAL 대비 REACTION 의 변화가 개입의 즉각 효과다.")
     print("  * 표본이 조건당 10 미만이면 평균만 보고 결론 내지 말 것.")
 
+def print_typea_scores(sessions):
+    """Type A 개입 전후 답변 품질 비교. 논문의 핵심 지표."""
+    rows = []
+    for s in sessions:
+        for ev in s.get("bargein", {}).get("events", []):
+            if ev.get("type") != "REDIRECT":
+                continue
+            rows.append((
+                ev.get("stage", ""),
+                ev.get("score_truncated", -1),
+                ev.get("score_reanswer", -1),
+                ev.get("score_final", -1),
+                ev.get("latency_judge_ms"),
+                ev.get("latency_to_speech_ms"),
+                ev.get("truncated_source", "final"),
+            ))
+    if not rows:
+        print("\n5. Type A 개입 전후 점수 — 해당 이벤트 없음")
+        return
+
+    print("\n5. Type A (REDIRECT) 개입 전후 답변 품질")
+    print("-" * 125)
+    print(f"{'단계':<14}{'잘린답변':>10}{'재답변':>10}{'최종':>8}"
+          f"{'판정(ms)':>10}{'첫발성(ms)':>12}{'채점출처':>16}")
+    print("-" * 125)
+    valid = [(t, r) for _, t, r, _, _, _, _ in rows if t >= 0 and r >= 0]
+    for stage, tr, re_, fin, lj, ls, src in rows:
+        print(f"{stage:<14}{tr:>10}{re_:>10}{fin:>8}"
+              f"{lj if lj else '-':>10}{ls if ls else '-':>12}{src:>16}")
+    print("-" * 125)
+    if valid:
+        d = sum(r - t for t, r in valid) / len(valid)
+        print(f"  재답변 - 잘린답변 평균 차이: {d:+.1f}점 (N={len(valid)})")
+    print(f"  * 이 값이 양수이면 개입이 답변 품질을 끌어올렸다는 방향이다.")
 
 # ---------------------------------------------------------------------------
 # 4. 조건별 기저선 — NORMAL 턴만

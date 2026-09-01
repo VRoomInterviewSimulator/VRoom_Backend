@@ -305,9 +305,9 @@ async def _send_thinking(sid: str, session: InterviewSession):
 # 효과: 첫 발성까지 약 1.7초 -> 0.7초(TTS 합성만).
 _INTERVENTION_TEMPLATES = {
     "LONG_ANSWER": [
-        "네, 거기까지 듣겠습니다. 답변이 너무 길어지고 있습니다.",
-        "잠시 끊겠습니다. 요점만 간결하게 말씀해 주셔야 합니다.",
-        "여기까지 하겠습니다. 답변 시간 관리도 평가 대상입니다.",
+        "답변이 너무 길어지고 있습니다. 요점만 간결하게 말씀해 주셔야 합니다.",
+        "핵심만 짧게 정리해 주셨어야 합니다.",
+        "답변 시간 관리도 평가 대상입니다.",
     ],
     "LONG_SILENCE": [
         "답변이 어려우신 것 같군요. 이 질문은 여기까지 하고 넘어가겠습니다.",
@@ -363,8 +363,12 @@ async def handle_partial_transcript(sid: str, session: InterviewSession,
  
     # 이미 개입해 재답변을 기다리는 중이면 다시 판정하지 않는다.
     if session.awaiting_reanswer:
+        if getattr(session, "_last_partial_deny", None) != "G4B_REANSWER":
+            session._last_partial_deny = "G4B_REANSWER"
+            print(f"[개입] REDIRECT 거부 (G4B_REANSWER) stage={session.stage.value} "
+                  f"chars={len(cumulative.replace(' ', ''))}")
         return
- 
+    
     decision = await bargein.evaluate_partial(session, cumulative)
  
     if not decision.granted:
@@ -379,15 +383,23 @@ async def handle_partial_transcript(sid: str, session: InterviewSession,
     session._last_partial_deny = None
     session.commit_bargein(decision)
  
-    # (1) 컷인 반사 명령 — 대사 생성을 기다리지 않고 먼저 보낸다.
+    # (1) 발화 순서 게이트.
+    #     잘린 전사가 개입 대사보다 먼저 도착하면 ws_tts 가 STT 워커로
+    #     {"type":"end"} 를 먼저 던지고, 그 end 가 Unity 에서 tts_end 로 풀려
+    #     아직 재생 중인 개입 대사를 SetEndOfStream 으로 끊어버린다.
+    session.bargein_speech_done = asyncio.Event()
+
+    # (2) 컷인 반사 명령 — 대사 생성을 기다리지 않고 먼저 보낸다.
     #     Unity 의 상태 전이(UserAnswering -> BargeInPending)와 발화 강제 확정,
     #     표정 변경이 전부 이 메시지에 달려 있다.
     await hub.send_json(sid, bargein.build_cutin_message(session, decision))
- 
-    # (2) 개입 대사는 별도 태스크로. 여기서 await 하면 수신 루프가 막힌다.
-    #     Type B 와 달리 워치독은 걸지 않는다. Type A 는 단계를 전진시키지
-    #     않으므로 전사가 늦게 와도 세션이 멈추지 않는다.
+
+    # (3) 개입 대사는 별도 태스크로
     asyncio.create_task(_speak_redirect(sid, session, decision))
+
+    # (4) 워치독 — 잘린 전사가 stt_skip 으로 유실되면 truncated_captured 가
+    #     영원히 False 로 남아 재답변이 잘린 답변으로 흡수된다
+    asyncio.create_task(_redirect_watchdog(sid, session))
  
  
 async def _speak_redirect(sid: str, session: InterviewSession, decision) -> None:
@@ -449,7 +461,30 @@ async def _speak_redirect(sid: str, session: InterviewSession, decision) -> None
                 fallback, is_final=False, bargein_type=decision.bargein_type))
         except Exception as e2:
             print(f"[개입] REDIRECT 폴백도 실패: {e2}")
+
+    finally:
+        ev = getattr(session, "bargein_speech_done", None)
+        if ev is not None:
+            ev.set()
  
+async def _redirect_watchdog(sid: str, session: InterviewSession):
+    """Type A: 잘린 전사가 끝내 오지 않을 때 대체 채점으로 상태를 정리한다.
+
+    Type B 와 달리 단계를 전진시키지 않는다. Type A 는 재답변을 받아야
+    하므로, 여기서는 '잘린 답변 자리'만 채우고 재답변을 기다린다.
+    """
+    await asyncio.sleep(BargeInConfig.REDIRECT_FINAL_WAIT)
+
+    if not session.awaiting_reanswer or session.truncated_captured:
+        return
+
+    print(f"[{sid}] [개입] 잘린 전사 미도착 - 부분 전사로 대체 채점")
+    try:
+        await session._absorb_missing_truncated()
+    except Exception as e:
+        print(f"[{sid}] [개입] 대체 채점 실패: {e}")
+        session.truncated_captured = True
+        session.pending_truncated_score = -1
 
 async def _speak_intervention(sid: str, session: InterviewSession, decision):
     """발화 1 — 개입 대사를 템플릿에서 골라 즉시 발송한다.
@@ -524,7 +559,7 @@ async def _cutoff_watchdog(sid: str, session: InterviewSession):
         await _speak_after_bargein(sid, session, packet)
 
 
-async def _await_bargein_speech(sid: str, session: InterviewSession):
+async def _await_bargein_speech(sid: str, session: InterviewSession, timeout: float | None = None):
     """발화 1 발송이 끝날 때까지 기다린다. 개입이 없었으면 즉시 통과한다.
 
     왜 락이 아니라 이벤트인가:
@@ -538,7 +573,8 @@ async def _await_bargein_speech(sid: str, session: InterviewSession):
 
     if not ev.is_set():
         try:
-            await asyncio.wait_for(ev.wait(), timeout=BargeInConfig.FINAL_WAIT_TIMEOUT)
+            await asyncio.wait_for(
+                ev.wait(), timeout=timeout or BargeInConfig.FINAL_WAIT_TIMEOUT)
         except asyncio.TimeoutError:
             print(f"[{sid}] [개입] 발화1 완료 대기 타임아웃 - 그대로 진행")
 
@@ -712,67 +748,97 @@ async def ws_tts(ws: WebSocket):
         print(f"[/ws/tts] STT 워커 연결됨 - Session ID: {sid}")
 
         while True:
-            msg = json.loads(await ws.receive_text())
-            mtype = msg.get("type", "")
+            try:
+                msg = json.loads(await ws.receive_text())
+                mtype = msg.get("type", "")
 
-            # ── Type A 부분 전사 ───────────────────────────────────────
-            # STT 워커(V1)가 발화 도중 누적 전사를 주기적으로 보낸다.
-            # 이 분기가 없으면 아래 `if not user_text` 에서 통째로 버려진다.
-            if mtype == "partial_transcript":
-                p_sid = msg.get("session_id") or sid or hub.last_active or "default"
-                p_session = hub.sessions.get(p_sid)
-                if p_session is not None:
-                    await handle_partial_transcript(
-                        p_sid, p_session, msg.get("cumulative", ""))
-                continue
+                # ── Type A 부분 전사 ───────────────────────────────────
+                # STT 워커(V1)가 발화 도중 누적 전사를 주기적으로 보낸다.
+                # 이 분기가 없으면 아래 `if not user_text` 에서 통째로 버려진다.
+                if mtype == "partial_transcript":
+                    p_sid = msg.get("session_id") or sid or hub.last_active or "default"
+                    p_session = hub.sessions.get(p_sid)
+                    if p_session is not None:
+                        await handle_partial_transcript(
+                            p_sid, p_session, msg.get("cumulative", ""))
+                    continue
 
-            user_text = msg.get("text", "")
-            if not user_text:
-                continue
+                user_text = msg.get("text", "")
+                if not user_text:
+                    continue
 
-            msg_sid = msg.get("session_id") or sid or hub.last_active or "default"
-            session = hub.sessions.get(msg_sid)
-            if session is None:
-                print(f"[/ws/tts] 활성 세션 없음 ({msg_sid}) - Unity init 이 먼저 필요")
+                msg_sid = msg.get("session_id") or sid or hub.last_active or "default"
+                session = hub.sessions.get(msg_sid)
+                if session is None:
+                    print(f"[/ws/tts] 활성 세션 없음 ({msg_sid}) - Unity init 이 먼저 필요")
+                    await ws.send_json({"type": "end"})
+                    continue
+
+                # STT 워커가 utterance_abort 로 강제 확정한 전사인가.
+                # Type A 의 '잘린 답변 / 재답변' 구분을 순서가 아니라 이 플래그로 한다.
+                truncated = bool(msg.get("truncated", False))
+
+                print(f"[STT→백엔드 수신 ({msg_sid})] {user_text}"
+                      f"{' [truncated]' if truncated else ''}")
+                await _send_thinking(msg_sid, session)
+
+                # (1) 채점 + 다음 질문 생성. 개입 중이면 여기가 발화 2에 해당한다.
+                packet = await session.on_user_answer(
+                    user_text, msg.get("features", {}), truncated=truncated)
+
+                if packet.type == "ignored":
+                    # Type A 잘린 답변 흡수 경로. 개입 대사가 같은 소켓으로
+                    # 오디오를 흘리는 중일 수 있으므로 반드시 기다린다.
+                    # 먼저 end 를 보내면 Unity Speaker 가 개입 대사를 끊는다.
+                    if packet.bargein_type == "REDIRECT":
+                        await _await_bargein_speech(msg_sid, session, timeout=15.0)
+                        # 개입 대사의 speak() 가 이미 end 를 보냈다. 중복 발송하지 않는다.
+                        continue
+                    await ws.send_json({"type": "end"})
+                    continue
+
+                print(f"[백엔드→TTS 대사] {packet.dialogue} "
+                      f"(stage={packet.stage}, persona={packet.persona}, "
+                      f"score={packet.score})")
+
+                # (2) 발화 1이 아직 나가는 중이면 끝날 때까지 기다린다.
+                await _await_bargein_speech(msg_sid, session)
+
+                # (3) 자막 + 행동 패킷을 Unity 로.
+                await hub.send_packet(msg_sid, packet)
+
+                # (4) 대사를 TTS 로 합성해 음성/자막을 STT 워커로 릴레이.
+                tts_ws = await hub.get_or_connect_tts_ws(msg_sid)
+                if tts_ws:
+                    try:
+                        async for chunk in tts_client.synthesize_ws_stream(
+                                tts_ws, packet.dialogue):
+                            if isinstance(chunk, bytes):
+                                await ws.send_bytes(chunk)
+                            else:
+                                await ws.send_text(chunk)
+                    except Exception as e:
+                        print(f"[/ws/tts] [{msg_sid}] TTS 릴레이 실패: {e}")
+                else:
+                    print(f"[/ws/tts] [{msg_sid}] TTS 소켓 유실로 릴레이 생략")
+
+                # (5) 발화 끝 신호. STT 워커가 이걸 받고 Unity VAD 잠금을 푼다.
                 await ws.send_json({"type": "end"})
-                continue
 
-            print(f"[STT→백엔드 수신 ({msg_sid})] {user_text}")
-            await _send_thinking(msg_sid, session)
+            except (WebSocketDisconnect, RuntimeError):
+                raise           # 진짜 연결 종료는 바깥 핸들러로 넘긴다
 
-            # (1) 채점 + 다음 질문 생성. 개입 중이면 여기가 발화 2에 해당한다.
-            packet = await session.on_user_answer(user_text, msg.get("features", {}))
-            if packet.type == "ignored":
-                await ws.send_json({"type": "end"})
-                continue
-
-            print(f"[백엔드→TTS 대사] {packet.dialogue} "
-                  f"(stage={packet.stage}, persona={packet.persona}, score={packet.score})")
-
-            # (2) 발화 1이 아직 나가는 중이면 끝날 때까지 기다린다.
-            #     LLM 생성은 이 앞에서 이미 끝났으므로, 생성은 발화 1 재생과
-            #     병렬로 진행되어 지연이 자연스럽게 가려진다.
-            await _await_bargein_speech(msg_sid, session)
-
-            # (3) 자막 + 행동 패킷을 Unity 로.
-            await hub.send_packet(msg_sid, packet)
-
-            # (4) 대사를 TTS 로 합성해 음성/자막을 STT 워커로 릴레이.
-            tts_ws = await hub.get_or_connect_tts_ws(msg_sid)
-            if tts_ws:
+            except Exception as e:
+                # 메시지 하나가 실패해도 소켓은 살려 둔다.
+                # 여기서 루프를 빠져나가면 finally 가 stt_sockets 에서 소켓을 지우고,
+                # 이후 개입 대사가 tts_end 를 못 보내 Unity 가 Interrupting 에 고착된다.
+                print(f"[/ws/tts] 메시지 처리 실패 ({sid}) - 세션 유지: {e}")
+                import traceback
+                traceback.print_exc()
                 try:
-                    async for chunk in tts_client.synthesize_ws_stream(tts_ws, packet.dialogue):
-                        if isinstance(chunk, bytes):
-                            await ws.send_bytes(chunk)
-                        else:
-                            await ws.send_text(chunk)
-                except Exception as e:
-                    print(f"[/ws/tts] [{msg_sid}] TTS 릴레이 실패: {e}")
-            else:
-                print(f"[/ws/tts] [{msg_sid}] TTS 소켓 유실로 릴레이 생략")
-
-            # (5) 발화 끝 신호. STT 워커가 이걸 받고 Unity VAD 잠금을 푼다.
-            await ws.send_json({"type": "end"})
+                    await ws.send_json({"type": "end"})
+                except Exception:
+                    pass
 
     except (WebSocketDisconnect, RuntimeError):
         print(f"[/ws/tts] STT 워커 연결 종료 - Session ID: {sid}")
@@ -780,7 +846,6 @@ async def ws_tts(ws: WebSocket):
         print(f"[/ws/tts] 에러 (Session ID {sid}): {e}")
     finally:
         hub.stt_sockets.pop(sid, None)
-
 
 @app.post("/process")
 async def process(req: AnswerRequest):

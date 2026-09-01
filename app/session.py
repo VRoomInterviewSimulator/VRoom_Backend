@@ -90,6 +90,7 @@ class InterviewSession:
         self.truncated_captured: bool = False        # Type A 잘린 전사를 이미 받았는가
         self.pending_truncated_text: str = ""        # 보관 중인 잘린 답변 텍스트
         self.pending_truncated_score: int = -1       # 보관 중인 잘린 답변 점수
+        self.pending_partial_text: str = ""          # (Type A) 이탈 판정에 쓴 부분 전사.
         self.utterance_started_at: float = 0.0       # 현재 발화 시작 시각 (G6 유예 계산용)
 
         # ── 실험 로그 ──────────────────────────────────────────────
@@ -205,7 +206,7 @@ class InterviewSession:
         self._record("interviewer", turn.dialogue)
         return self._to_packet(turn, is_final=False)
 
-    async def on_user_answer(self, text: str, features: dict) -> BehaviorPacket:
+    async def on_user_answer(self, text: str, features: dict, truncated: bool = False) -> BehaviorPacket:
         """사용자 답변을 받아 채점하고 다음 단계 발화를 만든다. 세션의 메인 루프.
 
         반환 패킷의 type 이 "ignored" 면 호출자는 Unity 로 아무것도 보내지 않아야 한다.
@@ -215,9 +216,18 @@ class InterviewSession:
             print(f"[{self.session_id}] 면접 종료 후 발화 수신 - 무시: {text[:30]}")
             return self._ignored_packet(Stage.DONE.value)
 
+        # (0-b) 워치독이 이미 잘린 답변 자리를 채운 뒤 도착한 늦은 전사.
+        #       재답변으로 오인하면 단계가 두 칸 전진한다.
+        if self.awaiting_reanswer and self.truncated_captured and truncated:
+            print(f"[개입] 늦게 도착한 잘린 전사 - 폐기: {text[:30]}")
+            return self._ignored_packet(self.stage.value, bargein_type="REDIRECT")
+        
         # (1) Type A 잘린 답변이면 채점만 하고 단계를 전진시키지 않는다.
         if self.awaiting_reanswer and not self.truncated_captured:
-            return await self._absorb_truncated_answer(text, features)
+            if truncated:
+                return await self._absorb_truncated_answer(text, features)
+        
+            await self._absorb_missing_truncated()
 
         # (2) 답변을 기록하고 음성 피쳐를 집계한다.
         #     이 세 줄은 항상 함께 실행되어야 리스트 인덱스 정합이 유지된다.
@@ -294,6 +304,7 @@ class InterviewSession:
 
         prev_stage_name = self.turn_stages[-1] if self.turn_stages else self.stage.value
         self.stage_scores.append((prev_stage_name, turn.score))
+        self._consecutive_low_prev = self.consecutive_low  
         self.consecutive_low = self.consecutive_low + 1 if turn.score < 40 else 0
         self.persona = persona_from_score(turn.score, self.consecutive_low, self.condition)
         turn = llm._clamp_to_set(turn, self.persona)
@@ -336,6 +347,7 @@ class InterviewSession:
             self.pending_redirect = decision
             self.awaiting_reanswer = True
             self.truncated_captured = False
+            self.pending_partial_text = decision.meta.get("partial_text", "")
         else:
             self.pending_cutoff = decision
 
@@ -403,6 +415,33 @@ class InterviewSession:
         # 개입 대사는 이미 별도로 발송되었으므로 여기서는 아무 대사도 보내지 않는다.
         return self._ignored_packet(self.stage.value, bargein_type="REDIRECT")
 
+    async def _absorb_missing_truncated(self) -> None:
+        """잘린 전사가 끝내 오지 않았을 때 부분 전사로 대체 채점한다.
+
+        Type A 의 유일한 치명적 실패 모드는 '재답변이 잘린 답변으로 흡수되어
+        단계가 전진하지 않는 것'이다. 여기서 truncated_captured 를 반드시 세워
+        그 경로를 끊는다. 부분 전사조차 없으면 점수는 -1 로 두고
+        _blend_reanswer_score 가 재답변 점수만 쓰도록 맡긴다.
+        """
+        self.truncated_captured = True
+        partial = (self.pending_partial_text or "").strip()
+
+        if not partial:
+            self.pending_truncated_score = -1
+            print("[개입] 잘린 전사·부분 전사 모두 없음 - 재답변 점수만 사용")
+            return
+
+        self.pending_truncated_text = partial
+        score = await llm.score_answer(
+            question=self.current_question_text, answer=partial)
+        self.pending_truncated_score = score
+        if self.bargein_log:
+            self.bargein_log[-1]["score_truncated"] = score
+            self.bargein_log[-1]["truncated_source"] = "partial_fallback"
+
+        print(f"[개입] 잘린 전사 유실 - 부분 전사로 대체 채점 score={score} "
+              f"'{partial[:30]}'")
+
     def _blend_reanswer_score(self, turn: LLMTurn) -> LLMTurn:
         """잘린 답변과 재답변 점수를 가중 혼합하고 Type A 대기 상태를 해제한다."""
         from .config import BargeInConfig as B
@@ -421,12 +460,27 @@ class InterviewSession:
         # stage_scores 에는 혼합값만 남기고, 원본 두 점수는 bargein_log 에 보존한다.
         if self.stage_scores and s_re >= 0:
             self.stage_scores[-1] = (self.stage_scores[-1][0], blended)
+        elif s_tr >= 0:
+            # 재답변 채점이 실패(-1)하면 _apply_score 가 조기 반환해
+            # stage_scores 에 그 턴이 아예 안 남는다. 잘린 답변 점수로라도 채운다.
+            self.stage_scores.append((self.turn_stages[-1] if self.turn_stages
+                                      else self.stage.value, blended))
+            print(f"[개입] 재답변 채점 실패 - 잘린 답변 점수({blended})로 대체 기록")
+
+        if s_re >= 0 and s_tr >= 0:
+            prev_low = getattr(self, "_consecutive_low_prev", 0)
+            self.consecutive_low = prev_low + 1 if blended < 40 else 0
+            self.persona = persona_from_score(blended, self.consecutive_low, self.condition)
+            turn = llm._clamp_to_set(turn, self.persona)
+            print(f"[개입] 혼합 점수 기준 페르소나 재산정 -> {self.persona.value}")
 
         print(f"[개입] 점수 혼합 truncated={s_tr} reanswer={s_re} -> {blended}")
 
         self.awaiting_reanswer = False
         self.truncated_captured = False
         self.pending_truncated_score = -1
+        self.pending_truncated_text = ""
+        self.pending_partial_text = ""
         self.pending_redirect = None
 
         turn.score = blended

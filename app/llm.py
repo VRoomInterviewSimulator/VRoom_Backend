@@ -370,9 +370,11 @@ def _intervention_system_prompt(info: ExtractedInfo) -> str:
 def _intervention_instruction(bargein_type: str, reason: str, question: str, partial_answer: str) -> str:
     if bargein_type == "REDIRECT":
         shape = (
-            "[대사 구성] [끊는 신호] + [지금까지 답변의 어떤 부분이 주제를 벗어났는지 짧게 지적] + [원본 질문을 그대로 다시 제시]\n"
+            "[대사 구성] [어떤 부분이 주제를 벗어났는지 한 문장으로 지적]"
+            " + [원본 질문의 핵심 키워드만 남긴 짧은 재질문]\n"
+            "원본 질문을 통째로 반복하지 마라. 전체 2문장, 60자 이내로 작성하라.\n"
             f"[원본 질문] {question}\n"
-        ) 
+        )
     else:
         shape = (
             "[대사 구성] [끊는 신호] + [간결한 마무리 지적] + [다음으로 넘어간다는 짧은 전환 문구]\n"
